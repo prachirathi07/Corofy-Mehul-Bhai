@@ -124,7 +124,7 @@ export class ProductDatabase {
       throw error
     }
 
-    return Array.from(new Set(data?.map(item => item.industry) || []))
+    return Array.from(new Set(data?.map((item: Product) => item.industry) || []))
   }
 
   // Get brands by industry
@@ -140,7 +140,7 @@ export class ProductDatabase {
       throw error
     }
 
-    return Array.from(new Set(data?.map(item => item.brandName) || []))
+    return Array.from(new Set(data?.map((item: Product) => item.brandName) || []))
   }
 
   // Get chemicals by brand
@@ -157,7 +157,7 @@ export class ProductDatabase {
       throw error
     }
 
-    return Array.from(new Set(data?.map(item => item.chemicalName) || []))
+    return Array.from(new Set(data?.map((item: Product) => item.chemicalName) || []))
   }
 
   // Get countries by selection
@@ -370,7 +370,7 @@ export class FounderDatabase {
 
       // Get unique industries (stored as text, not array)
       const industries = new Set<string>()
-      allData.forEach((founder: Record<string, unknown>) => {
+      allData.forEach((founder: Founder) => {
         const industry = founder["Company's Industry"]
         if (industry && typeof industry === 'string' && industry.trim()) {
           // Filter out old JSON array format (e.g., ["oil & energy"])
