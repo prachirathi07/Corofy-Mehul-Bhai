@@ -304,7 +304,7 @@ export class FounderDatabase {
       console.log('📊 Total founders fetched:', allData.length)
 
       // Filter by industry in JavaScript (to handle column name with apostrophe)
-      const filtered = allData.filter((founder: Record<string, unknown>) => {
+      const filtered = allData.filter((founder: Founder) => {
         const founderIndustry = founder["Company's Industry"]
         if (!founderIndustry || typeof founderIndustry !== 'string') {
           return false
