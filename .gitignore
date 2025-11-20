@@ -51,3 +51,8 @@ htmlcov/
 # Playwright
 .playwright/
 
+# Test files with potential secrets
+test_scrape.py
+apify_results.json
+results.json
+
