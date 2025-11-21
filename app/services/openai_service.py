@@ -1,25 +1,35 @@
 from openai import OpenAI
 from typing import Dict, Any, Optional
 from app.core.config import settings
+from app.core.email_data import PRODUCT_CATALOGS
 import logging
+import asyncio
+import json
 
 logger = logging.getLogger(__name__)
 
 class OpenAIService:
     """
-    Service for generating personalized emails using OpenAI
+    Service for generating personalized emails using OpenAI (SYNC client in async context)
     """
-    
+
     def __init__(self):
         self.api_key = settings.OPENAI_API_KEY
-        if not self.api_key:
-            raise ValueError("OPENAI_API_KEY is required. Please add it to your .env file.")
-        if self.api_key == "your_openai_api_key_here" or self.api_key.startswith("your_"):
-            raise ValueError("OPENAI_API_KEY is not set. Please add your actual OpenAI API key to the .env file.")
         
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY missing. Add it to your .env file.")
+
+        # Log which key is being used (first 20 and last 10 chars for security)
+        key_preview = f"{self.api_key[:20]}...{self.api_key[-10:]}" if len(self.api_key) > 30 else "***"
+        logger.info(f"🔑 OpenAI Service initialized with API key: {key_preview}")
+
+        # Use SYNC client (same as working test script) - this is the correct pattern
         self.client = OpenAI(api_key=self.api_key)
-        self.model = "gpt-4o-mini"  # Using gpt-4o-mini for cost efficiency, can be changed to gpt-4
-    
+
+        # Use gpt-4o-mini as requested
+        self.model = "gpt-4o-mini"
+        logger.info(f"🤖 Using model: {self.model}")
+
     async def generate_personalized_email(
         self,
         lead_name: str,
@@ -30,273 +40,212 @@ class OpenAIService:
         email_type: str = "initial",
         custom_context: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Generate a personalized email using OpenAI
-        
-        Args:
-            lead_name: Lead's name
-            lead_title: Lead's job title
-            company_name: Company name
-            company_website_content: Scraped website content (markdown)
-            company_industry: Company industry
-            email_type: Type of email (initial, followup_5day, followup_10day)
-            custom_context: Additional context for personalization
-        
-        Returns:
-            Dict with subject and body of the email
-        """
+
         try:
-            # Build the prompt based on email type
-            if email_type == "followup_5day":
-                prompt = self._build_followup_prompt(lead_name, lead_title, company_name, days=5)
-            elif email_type == "followup_10day":
-                prompt = self._build_followup_prompt(lead_name, lead_title, company_name, days=10)
+            # Log what we're working with
+            logger.info(f"🤖 OpenAI.generate_personalized_email called:")
+            logger.info(f"   - Lead: {lead_name} ({lead_title})")
+            logger.info(f"   - Company: {company_name}")
+            logger.info(f"   - Has website content: {bool(company_website_content)}")
+            
+            # Select prompt
+            if email_type in ["followup_5day", "followup_10day"]:
+                days = 5 if email_type == "followup_5day" else 10
+                prompt = self._build_followup_prompt(lead_name, lead_title, company_name, days)
+                system_msg = "You are an expert B2B outreach email writer. Return JSON."
             else:
                 prompt = self._build_initial_email_prompt(
-                    lead_name, lead_title, company_name, 
+                    lead_name, lead_title, company_name,
                     company_website_content, company_industry, custom_context
                 )
+                system_msg = (
+                    "You are an expert B2B outreach email writer specializing in highly personalized cold emails. "
+                    "You MUST analyze the provided company data and classify them into the correct industry. "
+                    "You MUST return your response in valid JSON format."
+                )
             
-            logger.info(f"Generating {email_type} email for {lead_name} at {company_name}")
+            logger.info(f"   - Prompt length: {len(prompt)} chars")
+
+            # Use sync client in thread pool (matches working test script exactly)
+            def _call_openai():
+                return self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=1500,
+                    temperature=0.7
+                )
             
-            # Call OpenAI API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert email copywriter specializing in personalized B2B outreach emails. Write professional, engaging, and personalized emails that feel authentic and not spammy."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.7,
-                max_tokens=1000
-            )
-            
-            # Extract the generated email
+            # Run sync call in thread pool to avoid blocking
+            logger.info(f"🔄 Calling OpenAI API with model: {self.model}")
+            response = await asyncio.to_thread(_call_openai)
+            logger.info(f"✅ OpenAI API call successful")
+
             generated_text = response.choices[0].message.content.strip()
+            logger.info(f"📝 Generated JSON length: {len(generated_text)} chars")
             
-            # Parse subject and body
-            email_parts = self._parse_email(generated_text)
+            # Parse JSON response
+            try:
+                result = json.loads(generated_text)
+            except json.JSONDecodeError:
+                logger.error(f"❌ Failed to parse OpenAI JSON response: {generated_text}")
+                return {
+                    "success": False,
+                    "error": "Failed to parse AI response",
+                    "raw_response": generated_text
+                }
+
+            subject = result.get("subject")
+            body = result.get("body")
+            industry = result.get("industry", "Other")
             
-            logger.info(f"Successfully generated email for {lead_name}")
+            logger.info(f"📧 Parsed subject: {subject}")
+            logger.info(f"🏭 Classified Industry: {industry}")
             
+            # Validate personalization
+            is_personalized = False
+            if company_website_content and company_website_content.strip():
+                body_lower = body.lower()
+                company_lower = company_name.lower()
+                has_company_name = company_lower in body_lower
+                is_personalized = has_company_name and len(body) > 100
+
             return {
                 "success": True,
-                "subject": email_parts.get("subject", "Re: Potential Collaboration"),
-                "body": email_parts.get("body", generated_text),
+                "subject": subject,
+                "body": body,
+                "industry": industry,
                 "email_type": email_type,
-                "is_personalized": company_website_content is not None and len(company_website_content) > 0
+                "is_personalized": is_personalized
             }
-            
+
         except Exception as e:
-            logger.error(f"Error generating email with OpenAI: {e}", exc_info=True)
+            error_msg = str(e)
+            logger.error(f"❌ OpenAI Error: {error_msg}", exc_info=True)
+
+            # Detailed error diagnostics
+            if "429" in error_msg or "quota" in error_msg.lower() or "insufficient_quota" in error_msg.lower():
+                key_preview = f"{self.api_key[:20]}...{self.api_key[-10:]}" if len(self.api_key) > 30 else "***"
+                logger.error("=" * 80)
+                logger.error("⚠️ QUOTA/BILLING ERROR DETECTED")
+                logger.error(f"   API Key being used: {key_preview}")
+                logger.error(f"   Model: {self.model}")
+                logger.error("   Possible causes:")
+                logger.error("   1. API key was created when account had $0 balance")
+                logger.error("   2. Account has insufficient credits")
+                logger.error("   3. API key doesn't have access to this model")
+                logger.error("   Solution: Create a NEW API key after adding funds to your account")
+                logger.error("=" * 80)
+
+            if "model" in error_msg.lower() and "not found" in error_msg.lower():
+                logger.error(f"⚠ MODEL NOT AVAILABLE: {self.model}")
+
             return {
                 "success": False,
-                "error": str(e),
+                "error": error_msg,
                 "subject": None,
-                "body": None
+                "body": None,
+                "industry": None
             }
-    
+
+    # --------------------------------------------------------------------
+    # PROMPT HELPERS
+    # --------------------------------------------------------------------
+
     def _build_initial_email_prompt(
         self,
         lead_name: str,
         lead_title: str,
         company_name: str,
-        company_website_content: Optional[str] = None,
-        company_industry: Optional[str] = None,
-        custom_context: Optional[str] = None
+        company_website_content: Optional[str],
+        company_industry: Optional[str],
+        custom_context: Optional[str]
     ) -> str:
-        """Build prompt for initial email"""
-        
-        # Ensure company_name is not None
-        company_name = company_name or "their company"
-        
-        prompt = f"""Write a personalized B2B outreach email with the following details:
 
-Recipient: {lead_name}
+        company_name = company_name or "the company"
+        
+        # Convert catalogs to string for prompt
+        catalogs_str = json.dumps(PRODUCT_CATALOGS, indent=2)
+
+        prompt = f"""
+TASK:
+1. Analyze the provided company website content to understand their business.
+2. Classify the company into ONE of these industries: "Agrochemical", "Oil & Gas", "Lubricant", or "Other".
+3. Select 2-3 relevant Corofy products from the PROVIDED PRODUCT CATALOGS below that match their industry.
+4. Write a personalized outreach email pitching those specific products.
+
+PROVIDED PRODUCT CATALOGS:
+{catalogs_str}
+
+RECIPIENT DETAILS:
+Name: {lead_name}
 Title: {lead_title}
-Company: {company_name}"""
-        
+Company: {company_name}
+"""
+
         if company_industry:
-            prompt += f"\nIndustry: {company_industry}"
-        
-        if company_website_content and len(company_website_content.strip()) > 0:
-            # Use first 5000 characters to get more context (increased from 3000)
-            content_preview = company_website_content[:5000]
-            logger.info(f"📝 OPENAI: Using website content for personalization ({len(content_preview)} chars out of {len(company_website_content)} total)")
-            logger.info(f"📝 OPENAI: Content preview (first 300 chars): {content_preview[:300]}...")
-            logger.info(f"📝 OPENAI: Company name being used: '{company_name}'")
+            prompt += f"Hinted Industry: {company_industry}\n"
+
+        if company_website_content:
+            preview = company_website_content[:8000]
             prompt += f"""
+COMPANY WEBSITE CONTENT:
+{'='*80}
+{preview}
+{'='*80}
 
-Company Website Information:
-{content_preview}
-
-CRITICAL INSTRUCTIONS:
-1. You MUST use the website information above to personalize this email
-2. Mention SPECIFIC details from their website (services, products, values, mission, etc.)
-3. Show that you've done research on their company
-4. Reference the company name "{company_name}" in the email (not "None")
-5. Make the email relevant and authentic based on what you learned from their website
-6. DO NOT use generic phrases - be specific about what impressed you from their website
-7. The subject line should also reference something specific from their website or company
-
-Example good personalization: "I noticed on your website that you specialize in [specific service/product]. Your approach to [specific detail] really caught my attention..."
-
-Example bad (generic): "I came across your company and was impressed" - this is too generic."""
+CRITICAL REQUIREMENTS:
+1. You MUST reference specific details from the website content (products, values, news).
+2. You MUST mention "{company_name}" by name in the email body.
+3. You MUST mention 2-3 specific Corofy products from the catalog that are relevant to them.
+4. FORBIDDEN PHRASES: "I came across your company", "I noticed", "I hope this email finds you well".
+5. Tone: Professional, direct, and value-oriented.
+"""
         else:
-            logger.warning(f"⚠️ OPENAI: No website content available - email will be generic")
-            prompt += "\n\nNote: No website content available. Write a professional but generic email."
-        
+            prompt += "\nNo website content provided. Write a generic but professional email pitching Corofy's chemical solutions.\n"
+
         if custom_context:
-            prompt += f"\n\nAdditional Context: {custom_context}"
-        
+            prompt += f"\nAdditional context: {custom_context}\n"
+
         prompt += """
-
-Requirements:
-- Write a professional, warm, and engaging email
-- Keep it concise (3-4 short paragraphs max)
-- Include a clear call-to-action
-- Don't be pushy or salesy
-- Show genuine interest in their business
-- Format: Start with "Subject: [subject line]" on first line, then email body
-
-Format your response as:
-Subject: [Your subject line here]
-
-[Email body here]"""
-        
+OUTPUT FORMAT (JSON):
+{
+    "industry": "Agrochemical" | "Oil & Gas" | "Lubricant" | "Other",
+    "subject": "...",
+    "body": "..."
+}
+"""
         return prompt
-    
+
+    # --------------------------------------------------------------------
     def _build_followup_prompt(
         self,
         lead_name: str,
         lead_title: str,
         company_name: str,
-        days: int = 5
+        days: int
     ) -> str:
-        """Build prompt for follow-up email"""
-        
-        prompt = f"""Write a polite follow-up email for a B2B outreach that was sent {days} days ago.
+
+        return f"""
+Write a follow-up email sent {days} days after initial outreach.
 
 Recipient: {lead_name}
 Title: {lead_title}
 Company: {company_name}
 
 Requirements:
-- Be polite and respectful
+- Short (2 paragraphs)
+- Polite
+- Soft CTA
 - Acknowledge they're busy
-- Briefly remind them of the previous email
-- Offer value or ask if they'd like to connect
-- Keep it short (2-3 paragraphs)
-- Don't be pushy
-- Format: Start with "Subject: [subject line]" on first line, then email body
 
-Format your response as:
-Subject: [Your subject line here]
-
-[Email body here]"""
-        
-        return prompt
-    
-    def _parse_email(self, generated_text: str) -> Dict[str, str]:
-        """Parse generated text to extract subject and body"""
-        
-        lines = generated_text.split('\n')
-        subject = None
-        body_lines = []
-        found_subject = False
-        
-        for line in lines:
-            if line.strip().startswith("Subject:") and not found_subject:
-                subject = line.replace("Subject:", "").strip()
-                found_subject = True
-            elif found_subject:
-                body_lines.append(line)
-            elif not found_subject and line.strip():
-                # If no subject line found, use first line as subject
-                if subject is None:
-                    subject = line.strip()[:100]  # Limit subject length
-                else:
-                    body_lines.append(line)
-        
-        body = '\n'.join(body_lines).strip()
-        
-        # If no subject found, use default
-        if not subject:
-            subject = "Re: Potential Collaboration"
-        
-        # If no body, use the whole text
-        if not body:
-            body = generated_text
-        
-        return {
-            "subject": subject,
-            "body": body
-        }
-    
-    def get_default_template(
-        self,
-        lead_name: str,
-        lead_title: str,
-        company_name: str,
-        email_type: str = "initial"
-    ) -> Dict[str, str]:
-        """
-        Get default email template (fallback when OpenAI fails or not available)
-        
-        Args:
-            lead_name: Lead's name
-            lead_title: Lead's job title
-            company_name: Company name
-            email_type: Type of email
-        
-        Returns:
-            Dict with subject and body
-        """
-        if email_type == "followup_5day":
-            return {
-                "subject": f"Following up - {company_name}",
-                "body": f"""Hi {lead_name.split()[0] if lead_name else 'there'},
-
-I wanted to follow up on my previous email about potential collaboration opportunities.
-
-I know you're busy, but I'd love to connect and see if there's a way we can work together.
-
-Would you be open to a quick conversation?
-
-Best regards"""
-            }
-        elif email_type == "followup_10day":
-            return {
-                "subject": f"One more follow-up - {company_name}",
-                "body": f"""Hi {lead_name.split()[0] if lead_name else 'there'},
-
-I wanted to reach out one more time regarding my previous emails.
-
-I understand you may not be interested right now, but if that changes, I'm here to help.
-
-Thanks for your time.
-
-Best regards"""
-            }
-        else:
-            # Initial email template
-            return {
-                "subject": f"Potential collaboration with {company_name}",
-                "body": f"""Hi {lead_name.split()[0] if lead_name else 'there'},
-
-I hope this email finds you well. I came across {company_name} and was impressed by your work in the industry.
-
-I'd love to explore potential collaboration opportunities that could benefit both our organizations.
-
-Would you be open to a brief conversation to discuss how we might work together?
-
-Looking forward to hearing from you.
-
-Best regards"""
-            }
+OUTPUT FORMAT (JSON):
+{{
+    "subject": "...",
+    "body": "..."
+}}
+"""
 

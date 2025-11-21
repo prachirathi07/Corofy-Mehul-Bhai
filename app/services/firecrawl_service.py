@@ -3,6 +3,7 @@ from app.core.config import settings
 import logging
 from urllib.parse import urlparse
 import httpx
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,10 @@ class FirecrawlService:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        
+        # Rate limiting: Max 3 concurrent requests to prevent hitting Firecrawl rate limits
+        self._semaphore = asyncio.Semaphore(3)
+        logger.info("🚦 FIRECRAWL: Rate limiter initialized (max 3 concurrent requests)")
     
     def _normalize_url(self, url: str) -> str:
         """
@@ -151,121 +156,126 @@ class FirecrawlService:
             formats = ["markdown"]
         
         try:
-            logger.info(f"🌐 FIRECRAWL: Starting scrape for {url}")
-            logger.info(f"🌐 FIRECRAWL: API key present: {bool(self.api_key)}")
-            logger.info(f"🌐 FIRECRAWL: Formats: {formats}")
+            # Rate limiting: Acquire semaphore slot (max 3 concurrent requests)
+            async with self._semaphore:
+                logger.info(f"🌐 FIRECRAWL: Starting scrape for {url}")
+                logger.info(f"🌐 FIRECRAWL: API key present: {bool(self.api_key)}")
+                logger.info(f"🌐 FIRECRAWL: Formats: {formats}")
+                
+                # Small delay to prevent hitting per-second rate limits
+                await asyncio.sleep(0.5)
             
-            # Build payload according to v2 API format
-            payload = {
-                "url": url,
-                "formats": formats,
-                "onlyMainContent": only_main_content
-            }
-            
-            # Add optional parameters
-            if include_tags:
-                payload["includeTags"] = include_tags
-            if exclude_tags:
-                payload["excludeTags"] = exclude_tags
-            if max_age is not None:
-                payload["maxAge"] = max_age
-            if timeout is not None:
-                payload["timeout"] = timeout
-            
-            logger.info(f"🌐 FIRECRAWL: Payload: {payload}")
-            
-            # Make async HTTP request to Firecrawl v2 API
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                logger.info(f"🌐 FIRECRAWL: Sending POST request to {self.api_url}")
-                response = await client.post(
-                    self.api_url,
-                    json=payload,
-                    headers=self.headers
-                )
-                
-                logger.info(f"🌐 FIRECRAWL: Response status: {response.status_code}")
-                
-                # Check for HTTP errors
-                if response.status_code != 200:
-                    error_msg = f"Firecrawl API error: {response.status_code} - {response.text}"
-                    logger.error(f"❌ FIRECRAWL ERROR: {error_msg}")
-                    return {
-                        "success": False,
-                        "error": error_msg,
-                        "url": url,
-                        "content": None
-                    }
-                
-                # Parse response
-                result = response.json()
-                logger.info(f"🌐 FIRECRAWL: Response keys: {list(result.keys()) if isinstance(result, dict) else 'N/A'}")
-                
-                # Check if response has error
-                if "error" in result:
-                    error_msg = result.get("error", "Unknown error from Firecrawl")
-                    logger.error(f"❌ FIRECRAWL ERROR: {error_msg}")
-                    return {
-                        "success": False,
-                        "error": error_msg,
-                        "url": url,
-                        "content": None
-                    }
-                
-                # Extract data from response
-                # Firecrawl v2 API response structure: {"success": true, "data": {"markdown": "...", "metadata": {...}}}
-                data = result.get("data", {})
-                
-                if not data:
-                    # Fallback: maybe response is directly the data
-                    data = result if isinstance(result, dict) else {}
-                
-                logger.info(f"🌐 FIRECRAWL: Data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
-                
-                # Extract content based on response format
-                markdown_content = ""
-                html_content = ""
-                metadata = {}
-                
-                if isinstance(data, dict):
-                    # Check for markdown content (v2 API format)
-                    markdown_content = data.get("markdown") or data.get("content", "")
-                    html_content = data.get("html", "")
-                    metadata = data.get("metadata", {})
-                    
-                    # If metadata is nested or in different format, try to extract from root
-                    if not metadata and "metadata" in result:
-                        metadata = result.get("metadata", {})
-                    
-                    logger.info(f"🌐 FIRECRAWL: Extracted markdown length: {len(markdown_content)}, HTML length: {len(html_content)}")
-                else:
-                    # If data is a string, treat as markdown
-                    markdown_content = str(data) if data else ""
-                    logger.info(f"🌐 FIRECRAWL: Data is string, length: {len(markdown_content)}")
-                
-                # Log if markdown is empty
-                if not markdown_content or len(markdown_content.strip()) == 0:
-                    logger.warning(f"⚠️ FIRECRAWL: Markdown content is empty! Response structure: {list(result.keys())}")
-                    logger.warning(f"⚠️ FIRECRAWL: Full response data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
-                
-                logger.info(f"🌐 FIRECRAWL: Final content extracted - Markdown length: {len(markdown_content)}, HTML length: {len(html_content)}")
-                
-                # Ensure metadata is a dict
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                
-                logger.info(f"✅ FIRECRAWL SUCCESS: Scraped {url} - Content length: {len(markdown_content)} chars")
-                
-                return {
-                    "success": True,
+                # Build payload according to v2 API format
+                payload = {
                     "url": url,
-                    "domain": self._extract_domain(url),
-                    "markdown": markdown_content,
-                    "html": html_content,
-                    "metadata": metadata,
-                    "title": metadata.get("title", "") if isinstance(metadata, dict) else "",
-                    "description": metadata.get("description", "") if isinstance(metadata, dict) else "",
-                    "content_length": len(markdown_content)
+                    "formats": formats,
+                    "onlyMainContent": only_main_content
                 }
+                
+                # Add optional parameters
+                if include_tags:
+                    payload["includeTags"] = include_tags
+                if exclude_tags:
+                    payload["excludeTags"] = exclude_tags
+                if max_age is not None:
+                    payload["maxAge"] = max_age
+                if timeout is not None:
+                    payload["timeout"] = timeout
+                
+                logger.info(f"🌐 FIRECRAWL: Payload: {payload}")
+                
+                # Make async HTTP request to Firecrawl v2 API
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    logger.info(f"🌐 FIRECRAWL: Sending POST request to {self.api_url}")
+                    response = await client.post(
+                        self.api_url,
+                        json=payload,
+                        headers=self.headers
+                    )
+                    
+                    logger.info(f"🌐 FIRECRAWL: Response status: {response.status_code}")
+                    
+                    # Check for HTTP errors
+                    if response.status_code != 200:
+                        error_msg = f"Firecrawl API error: {response.status_code} - {response.text}"
+                        logger.error(f"❌ FIRECRAWL ERROR: {error_msg}")
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "url": url,
+                            "content": None
+                        }
+                    
+                    # Parse response
+                    result = response.json()
+                    logger.info(f"🌐 FIRECRAWL: Response keys: {list(result.keys()) if isinstance(result, dict) else 'N/A'}")
+                    
+                    # Check if response has error
+                    if "error" in result:
+                        error_msg = result.get("error", "Unknown error from Firecrawl")
+                        logger.error(f"❌ FIRECRAWL ERROR: {error_msg}")
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "url": url,
+                            "content": None
+                        }
+                    
+                    # Extract data from response
+                    # Firecrawl v2 API response structure: {"success": true, "data": {"markdown": "...", "metadata": {...}}}
+                    data = result.get("data", {})
+                    
+                    if not data:
+                        # Fallback: maybe response is directly the data
+                        data = result if isinstance(result, dict) else {}
+                    
+                    logger.info(f"🌐 FIRECRAWL: Data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                    
+                    # Extract content based on response format
+                    markdown_content = ""
+                    html_content = ""
+                    metadata = {}
+                    
+                    if isinstance(data, dict):
+                        # Check for markdown content (v2 API format)
+                        markdown_content = data.get("markdown") or data.get("content", "")
+                        html_content = data.get("html", "")
+                        metadata = data.get("metadata", {})
+                        
+                        # If metadata is nested or in different format, try to extract from root
+                        if not metadata and "metadata" in result:
+                            metadata = result.get("metadata", {})
+                        
+                        logger.info(f"🌐 FIRECRAWL: Extracted markdown length: {len(markdown_content)}, HTML length: {len(html_content)}")
+                    else:
+                        # If data is a string, treat as markdown
+                        markdown_content = str(data) if data else ""
+                        logger.info(f"🌐 FIRECRAWL: Data is string, length: {len(markdown_content)}")
+                    
+                    # Log if markdown is empty
+                    if not markdown_content or len(markdown_content.strip()) == 0:
+                        logger.warning(f"⚠️ FIRECRAWL: Markdown content is empty! Response structure: {list(result.keys())}")
+                        logger.warning(f"⚠️ FIRECRAWL: Full response data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+                    
+                    logger.info(f"🌐 FIRECRAWL: Final content extracted - Markdown length: {len(markdown_content)}, HTML length: {len(html_content)}")
+                    
+                    # Ensure metadata is a dict
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    
+                    logger.info(f"✅ FIRECRAWL SUCCESS: Scraped {url} - Content length: {len(markdown_content)} chars")
+                    
+                    return {
+                        "success": True,
+                        "url": url,
+                        "domain": self._extract_domain(url),
+                        "markdown": markdown_content,
+                        "html": html_content,
+                        "metadata": metadata,
+                        "title": metadata.get("title", "") if isinstance(metadata, dict) else "",
+                        "description": metadata.get("description", "") if isinstance(metadata, dict) else "",
+                        "content_length": len(markdown_content)
+                    }
             
         except httpx.TimeoutException as e:
             error_msg = f"Firecrawl API timeout: {str(e)}"
