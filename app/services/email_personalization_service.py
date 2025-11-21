@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional
 from app.services.openai_service import OpenAIService
 from app.services.website_service import WebsiteService
 from app.core.database import get_db
+from app.core.email_data import EMAIL_TEMPLATES, DEFAULT_TEMPLATE
 from supabase import Client
 import logging
 
@@ -135,7 +136,6 @@ class EmailPersonalizationService:
             logger.info(f"   - Lead: {lead_name}")
             logger.info(f"   - Company: {company_name}")
             logger.info(f"   - Has website content: {bool(company_website_content)}")
-            logger.info(f"   - Website content length: {len(company_website_content) if company_website_content else 0} chars")
             
             email_result = await self.openai_service.generate_personalized_email(
                 lead_name=lead_name,
@@ -146,32 +146,61 @@ class EmailPersonalizationService:
                 email_type=email_type
             )
             
-            logger.info(f"🤖 PERSONALIZATION: OpenAI result - Success: {email_result.get('success')}, Is_personalized: {email_result.get('is_personalized')}")
+            logger.info(f"🤖 PERSONALIZATION: OpenAI result - Success: {email_result.get('success')}, Industry: {email_result.get('industry')}")
             
             if email_result.get("success"):
+                # Select Template based on Industry
+                # RULE: Only use industry-specific templates if we actually have website content to verify the industry.
+                # If no website content, force "Other" to use the DEFAULT_TEMPLATE.
+                if company_website_content and len(company_website_content.strip()) > 0:
+                    industry = email_result.get("industry", "Other")
+                else:
+                    industry = "Other"
+                    logger.info(f"ℹ️ No website content available. Forcing use of DEFAULT_TEMPLATE.")
+
+                template = EMAIL_TEMPLATES.get(industry, DEFAULT_TEMPLATE)
+                
+                # Inject Content into Template
+                # Note: The AI generates the "BodyContent" which is the pitch. 
+                # The template handles the greeting, signature, and company info.
+                
+                # Clean up lead name for greeting
+                greeting_name = lead_name.split()[0] if lead_name else "there"
+                
+                # Replace placeholders
+                final_html_body = template.replace("{{LeadName}}", greeting_name)
+                final_html_body = final_html_body.replace("{{BodyContent}}", email_result.get("body"))
+                
                 return {
                     "success": True,
                     "subject": email_result.get("subject"),
-                    "body": email_result.get("body"),
+                    "body": final_html_body, # Return full HTML
+                    "industry": industry,
                     "is_personalized": email_result.get("is_personalized", website_scraped),
                     "company_website_used": website_scraped,
                     "from_cache": False,
                     "email_type": email_type
                 }
             else:
-                # Fallback to default template
+                # Fallback to default template when OpenAI fails
                 logger.warning(f"OpenAI generation failed, using default template: {email_result.get('error')}")
-                default_template = self.openai_service.get_default_template(
-                    lead_name=f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip() or lead.get('email', '').split('@')[0],
-                    lead_title=lead.get("title", ""),
-                    company_name=lead.get("company_name", ""),
-                    email_type=email_type
-                )
+                
+                lead_name = f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip() or lead.get('email', '').split('@')[0]
+                greeting_name = lead_name.split()[0] if lead_name else "there"
+                company_name = lead.get("company_name", "their company")
+                
+                # Simple default content
+                default_subject = f"Potential collaboration with {company_name}"
+                default_pitch = f"I hope this email finds you well. I came across {company_name} and was impressed by your work. I'd love to explore potential collaboration opportunities."
+                
+                # Use default HTML template
+                final_html_body = DEFAULT_TEMPLATE.replace("{{LeadName}}", greeting_name)
+                final_html_body = final_html_body.replace("{{BodyContent}}", default_pitch)
                 
                 return {
                     "success": True,
-                    "subject": default_template.get("subject"),
-                    "body": default_template.get("body"),
+                    "subject": default_subject,
+                    "body": final_html_body,
                     "is_personalized": False,
                     "company_website_used": False,
                     "from_cache": False,
@@ -185,4 +214,3 @@ class EmailPersonalizationService:
                 "success": False,
                 "error": str(e)
             }
-
