@@ -9,6 +9,7 @@ from app.services.timezone_service import TimezoneService
 from supabase import Client
 import logging
 import pytz
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +325,9 @@ class EmailSendingService:
                     
                     # Update queue status to "sending"
                     self.db.table("email_queue").update({"status": "sending"}).eq("id", queue_id).execute()
+                    
+                    # Rate limiting: Wait 1.5 seconds before sending to avoid Gmail API rate limits
+                    await asyncio.sleep(1.5)
                     
                     # Send email via webhook
                     webhook_result = await self.webhook_service.send_email_via_webhook(

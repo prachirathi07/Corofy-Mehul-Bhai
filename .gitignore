@@ -53,6 +53,7 @@ htmlcov/
 
 # Test files with potential secrets
 test_scrape.py
+check_keys.py
 apify_results.json
 results.json
 

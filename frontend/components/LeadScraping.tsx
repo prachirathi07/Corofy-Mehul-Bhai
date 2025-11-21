@@ -11,6 +11,7 @@ export default function LeadScraping() {
   const [formData, setFormData] = useState({
     source: 'apify', // 'apollo' or 'apify'
     countries: '',
+    sic_codes: '',
     c_suites: '',
     employee_size_min: '',
     employee_size_max: '',
@@ -32,6 +33,9 @@ export default function LeadScraping() {
 
       if (formData.countries) {
         params.countries = formData.countries.split(',').map(c => c.trim()).filter(c => c);
+      }
+      if (formData.sic_codes) {
+        params.sic_codes = formData.sic_codes.split(',').map(c => c.trim()).filter(c => c);
       }
       if (formData.c_suites) {
         params.c_suites = formData.c_suites.split(',').map(c => c.trim()).filter(c => c);
@@ -82,6 +86,22 @@ export default function LeadScraping() {
           />
         </div>
 
+        {formData.source === 'apollo' && (
+          <div className="form-group">
+            <label>SIC Codes (comma-separated, e.g., 2834, 2869, 2879) - Required for Apollo</label>
+            <input
+              type="text"
+              value={formData.sic_codes}
+              onChange={(e) => setFormData({ ...formData, sic_codes: e.target.value })}
+              placeholder="2834, 2869, 2879"
+              required={formData.source === 'apollo'}
+            />
+            <small style={{ color: '#666', fontSize: '12px', display: 'block', marginTop: '4px' }}>
+              SIC codes are required for Apollo scraping. Example: 2834 (Pharmaceuticals), 2869 (Industrial Organic Chemicals)
+            </small>
+          </div>
+        )}
+
         <div className="form-row">
           <div className="form-group">
             <label>C-Suites (comma-separated, e.g., CEO,COO)</label>
@@ -125,11 +145,19 @@ export default function LeadScraping() {
         </div>
 
         <div className="form-group">
-          <label>Total Leads Wanted</label>
+          <label>Total Leads Wanted (Max: 10)</label>
           <input
             type="number"
             value={formData.total_leads_wanted}
-            onChange={(e) => setFormData({ ...formData, total_leads_wanted: e.target.value })}
+            onChange={(e) => {
+              const value = e.target.value;
+              const numValue = parseInt(value);
+              if (value === '' || (numValue >= 1 && numValue <= 10)) {
+                setFormData({ ...formData, total_leads_wanted: value });
+              }
+            }}
+            min="1"
+            max="10"
             required
           />
         </div>

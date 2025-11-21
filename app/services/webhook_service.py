@@ -76,21 +76,48 @@ class WebhookService:
                 logger.info(f"📥 WEBHOOK RESPONSE DATA: {response_data}")
                 
                 # Check if n8n confirms email was sent
-                # n8n typically returns success in response body or status code
-                is_success = (
-                    response.status_code == 200 or 
-                    response.status_code == 201 or
-                    response_data.get("success") == True or
-                    response_data.get("sent") == True or
-                    "success" in str(response_data).lower() or
-                    "sent" in str(response_data).lower()
-                )
+                # Improved response parsing for new n8n workflow format
+                is_success = False
+                message_id = None
+                thread_id = None
+                
+                # Check response status code
+                if response.status_code in [200, 201]:
+                    # Check for explicit success flag in response
+                    if response_data.get("success") == True:
+                        is_success = True
+                        message_id = response_data.get("message_id")
+                        thread_id = response_data.get("thread_id")
+                    # Fallback: check if message_id exists (indicates email was sent)
+                    elif response_data.get("message_id"):
+                        is_success = True
+                        message_id = response_data.get("message_id")
+                        thread_id = response_data.get("thread_id")
+                    # Legacy fallback: check for success indicators in message
+                    elif "success" in str(response_data).lower() or "sent" in str(response_data).lower():
+                        is_success = True
+                
+                # Build webhook response with Gmail IDs if available
+                webhook_response = {
+                    "success": is_success,
+                    "message": response_data.get("message", "Email sent via webhook" if is_success else "Email sending failed"),
+                    "timestamp": response_data.get("timestamp")
+                }
+                
+                if message_id:
+                    webhook_response["message_id"] = message_id
+                if thread_id:
+                    webhook_response["thread_id"] = thread_id
+                if not is_success:
+                    webhook_response["error"] = response_data.get("error", "Unknown error")
+                
+                logger.info(f"📥 WEBHOOK RESPONSE PARSED: success={is_success}, message_id={message_id}, thread_id={thread_id}")
                 
                 return {
                     "success": is_success,
-                    "webhook_response": response_data,
+                    "webhook_response": webhook_response,
                     "status_code": response.status_code,
-                    "message": response_data.get("message", "Email sent via webhook") if is_success else "Webhook responded but email status unclear"
+                    "message": webhook_response.get("message", "Email sent via webhook" if is_success else "Email sending failed")
                 }
         
         except httpx.TimeoutException:

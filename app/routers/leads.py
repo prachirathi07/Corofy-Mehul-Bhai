@@ -154,8 +154,16 @@ async def _send_emails_to_leads(lead_ids: List[str], db: Client):
                 
                 processed += 1
                 
-                # Small delay to avoid overwhelming APIs
-                await asyncio.sleep(0.5)
+                # Rate limiting: Wait 1.5-2 seconds between email sends to avoid Gmail API rate limits
+                # Gmail API limit: ~250 requests per 100 seconds per user
+                # Safe rate: 1 email per 1.5-2 seconds = ~40-60 emails per minute
+                if not should_queue:  # Only add delay if we actually sent an email
+                    delay_seconds = 1.5
+                    logger.info(f"⏳ Rate limiting: Waiting {delay_seconds}s before next email send...")
+                    await asyncio.sleep(delay_seconds)
+                else:
+                    # Smaller delay for queued emails (no webhook call)
+                    await asyncio.sleep(0.2)
                 
             except Exception as e:
                 logger.error(f"❌ Error processing lead {lead_id}: {e}", exc_info=True)
@@ -236,17 +244,18 @@ async def scrape_leads(
         all_leads = []
         
         if source == "apollo":
-            # Apollo scraping
+            # Apollo scraping (matches n8n workflow exactly)
             apollo_service = ApolloService()
-            apollo_leads = await apollo_service.search_people(
+            all_leads = await apollo_service.search_people(
                 employee_size_min=employee_size_min,
                 employee_size_max=employee_size_max,
                 countries=countries or [],
                 sic_codes=sic_codes or [],
                 c_suites=c_suites,
+                industry=industry,
                 total_leads_wanted=total_leads_wanted
             )
-            all_leads = apollo_leads[:total_leads_wanted] if total_leads_wanted else apollo_leads
+            logger.info(f"Apollo: Retrieved {len(all_leads)} leads")
             
         elif source == "apify":
             # Apify scraping

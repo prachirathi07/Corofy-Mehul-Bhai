@@ -1,4 +1,5 @@
 import httpx
+import asyncio
 from typing import List, Dict, Any, Optional
 from app.core.config import settings
 from app.models.apollo_search import ApolloSearchCreate
@@ -50,12 +51,11 @@ class ApolloService:
         sic_codes: Optional[List[str]] = None,
         c_suites: Optional[List[str]] = None,
         industry: Optional[str] = None,
-        page: int = 1,
-        per_page: int = 100,
-        total_leads_wanted: Optional[int] = None
-    ) -> Dict[str, Any]:
+        total_leads_wanted: int = 625
+    ) -> List[LeadCreate]:
         """
-        Search for people/leads using Apollo API (matches n8n workflow)
+        Search for people/leads using Apollo API (matches n8n workflow exactly)
+        Implements: Search with pagination → Match each person → Parse → Return leads
         
         Args:
             employee_size_min: Minimum employee size
@@ -64,106 +64,140 @@ class ApolloService:
             sic_codes: List of SIC codes
             c_suites: List of C-suite titles (defaults to: CEO, COO, Director, President, Owner, Founder, Board of Directors)
             industry: Industry filter (stored for reference)
-            page: Page number
-            per_page: Results per page (max 100)
-            total_leads_wanted: Target number of leads (for pagination calculation)
+            total_leads_wanted: Target number of leads (default: 625, matches n8n)
         
         Returns:
-            Dict containing people data and pagination info
+            List of LeadCreate objects
         """
-        url = f"{self.BASE_URL}/mixed_people/search"
-        
         # Default C-suite titles from n8n workflow
         if not c_suites:
             c_suites = ["CEO", "COO", "Director", "President", "Owner", "Founder", "Board of Directors"]
         
-        # Build payload matching n8n workflow exactly
-        # Note: Apollo requires api_key in BOTH header (x-api-key) AND body
-        payload = {
-            "api_key": self.api_key,  # Required in body
-            "reveal_personal_emails": True,
-            "email_status": ["verified", "guessed"],
-            "page": page,
-            "per_page": min(per_page, 100),
-        }
+        # Calculate pagination (matches n8n workflow: 8 pages for 625 leads)
+        leads_per_page = 100  # Apollo max
+        total_pages = (total_leads_wanted + leads_per_page - 1) // leads_per_page  # Ceiling division
         
-        # Employee size ranges
-        employee_ranges = self._get_employee_size_ranges(employee_size_min, employee_size_max)
-        if employee_ranges:
-            payload["organization_num_employees_ranges"] = employee_ranges
+        logger.info(f"Apollo: Fetching {total_leads_wanted} leads across {total_pages} pages")
         
-        # SIC codes (using organization_sic_codes as per n8n)
-        if sic_codes:
-            payload["organization_sic_codes"] = sic_codes
+        all_people = []
         
-        # Countries (using person_locations as per n8n)
-        if countries:
-            payload["person_locations"] = countries
-        
-        # C-suite titles
-        if c_suites:
-            payload["person_titles"] = c_suites
-        
-        # Store industry for reference (not used in API but stored)
-        if industry:
-            payload["_industry_filter"] = industry
-        
-        # Headers - must include x-api-key (Apollo requires both header and body)
-        request_headers = {
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
-            "x-api-key": self.api_key  # Required in header
-        }
-        
-        # Query params - reveal_personal_emails as query param (per n8n workflow)
-        query_params = {
-            "reveal_personal_emails": "true"
-        }
-        
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"Making Apollo API request to: {url}")
-                logger.debug(f"Payload keys: {list(payload.keys())}")
-                logger.debug(f"Headers: {list(request_headers.keys())}")
+        # Step 1: Search with pagination (matches n8n Code5 → HTTP Request4)
+        for page in range(1, total_pages + 1):
+            try:
+                logger.info(f"Apollo: Fetching page {page}/{total_pages}")
                 
-                response = await client.post(
-                    url,
-                    json=payload,
-                    headers=request_headers,
-                    params=query_params
-                )
+                # Build payload matching n8n workflow exactly
+                payload = {
+                    "api_key": self.api_key,
+                    "organization_sic_codes": sic_codes or [],
+                    "person_locations": countries or [],
+                    "person_titles": c_suites,
+                    "organization_num_employees_ranges": self._get_employee_size_ranges(employee_size_min, employee_size_max),
+                    "reveal_personal_emails": True,
+                    "email_status": ["verified", "guessed"],
+                    "page": page,
+                    "per_page": leads_per_page,
+                    "_industry_filter": industry or ""
+                }
                 
-                # Log response for debugging
-                logger.info(f"Apollo API response status: {response.status_code}")
+                # Headers matching n8n workflow
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "x-api-key": self.api_key,
+                    "Content-Type": "application/json"
+                }
                 
-                if response.status_code == 401:
-                    error_detail = response.text
-                    logger.error(f"Apollo API 401 Unauthorized. Check your API key.")
-                    logger.error(f"Response: {error_detail}")
-                    raise Exception(f"Apollo API authentication failed (401). Please verify your APOLLO_API_KEY in .env file. Response: {error_detail}")
+                # Query params
+                query_params = {
+                    "reveal_personal_emails": "true"
+                }
                 
-                if response.status_code == 422:
-                    # Handle insufficient credits or validation errors
-                    try:
+                url = f"{self.BASE_URL}/mixed_people/search"
+                
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    response = await client.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        params=query_params
+                    )
+                    
+                    if response.status_code == 401:
+                        raise Exception(f"Apollo API authentication failed (401). Check your API key.")
+                    
+                    if response.status_code == 422:
                         error_data = response.json()
                         error_msg = error_data.get("error", "Unknown error")
                         if "insufficient credits" in error_msg.lower():
-                            logger.error("Apollo API: Insufficient credits")
-                            raise Exception(f"Apollo API: Insufficient credits. Please upgrade your Apollo plan or add credits. Visit: https://app.apollo.io/#/settings/plans/upgrade")
-                        else:
-                            raise Exception(f"Apollo API validation error (422): {error_msg}")
-                    except:
-                        raise Exception(f"Apollo API error (422): {response.text}")
+                            raise Exception(f"Apollo API: Insufficient credits. Please upgrade your plan.")
+                        raise Exception(f"Apollo API validation error (422): {error_msg}")
+                    
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Extract people array (matches n8n Split Out2)
+                    people = data.get("people", [])
+                    logger.info(f"Apollo: Page {page} returned {len(people)} people")
+                    all_people.extend(people)
+                    
+                    # Stop if we have enough leads
+                    if len(all_people) >= total_leads_wanted:
+                        all_people = all_people[:total_leads_wanted]
+                        break
+                        
+            except Exception as e:
+                logger.error(f"Apollo: Error fetching page {page}: {e}")
+                # Continue with other pages
+                continue
+        
+        logger.info(f"Apollo: Total {len(all_people)} people found from search")
+        
+        # Step 2: For each person, get full details via match endpoint (matches n8n HTTP Request5)
+        all_leads = []
+        for idx, person in enumerate(all_people):
+            try:
+                person_id = person.get("id")
+                if not person_id:
+                    logger.warning(f"Apollo: Person {idx} has no ID, skipping")
+                    continue
                 
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Apollo API HTTP error: {e.response.status_code}")
-            logger.error(f"Response: {e.response.text}")
-            raise Exception(f"Apollo API error ({e.response.status_code}): {e.response.text}")
-        except httpx.HTTPError as e:
-            logger.error(f"Apollo API request error: {e}")
-            raise Exception(f"Failed to fetch leads from Apollo: {str(e)}")
+                # Small delay to avoid rate limiting (0.1s between match calls)
+                if idx > 0:
+                    await asyncio.sleep(0.1)
+                
+                # Call match endpoint to get full details (matches n8n HTTP Request5)
+                person_details = await self.get_person_details(str(person_id))
+                
+                # Extract email (matches n8n Code node)
+                email = self.extract_email(person)
+                if not email and person_details:
+                    email = self.extract_email(person_details)
+                
+                # Parse into LeadCreate (matches n8n Edit Fields2)
+                lead = self.parse_apollo_response(person, person_details)
+                
+                # Override email if we found it
+                if email:
+                    lead.email = email
+                
+                all_leads.append(lead)
+                
+                # Log progress every 50 leads
+                if (idx + 1) % 50 == 0:
+                    logger.info(f"Apollo: Processed {idx + 1}/{len(all_people)} people")
+                    
+            except Exception as e:
+                logger.warning(f"Apollo: Error processing person {idx}: {e}")
+                # Try to create lead from original data without match
+                try:
+                    lead = self.parse_apollo_response(person, None)
+                    all_leads.append(lead)
+                except:
+                    logger.error(f"Apollo: Failed to parse person {idx}, skipping")
+                    continue
+        
+        logger.info(f"Apollo: Successfully parsed {len(all_leads)} leads")
+        return all_leads
     
     async def get_person_details(self, person_id: str) -> Dict[str, Any]:
         """
@@ -244,7 +278,7 @@ class ApolloService:
         person_details: Optional[Dict[str, Any]] = None
     ) -> LeadCreate:
         """
-        Parse Apollo API response into LeadCreate object (matches n8n workflow)
+        Parse Apollo API response into LeadCreate object (matches n8n Edit Fields2 exactly)
         
         Args:
             apollo_data: Raw person data from Apollo search
@@ -253,46 +287,66 @@ class ApolloService:
         Returns:
             LeadCreate object
         """
-        # Use detailed data if available, otherwise use original
-        person = person_details.get("person", apollo_data) if person_details else apollo_data
+        # Use detailed data if available, otherwise use original (matches n8n flow)
+        if person_details and person_details.get("person"):
+            person = person_details.get("person")
+        else:
+            person = apollo_data
         
         # Extract organization data
         organization = person.get("organization", {})
         
-        # Extract email using the extraction logic
-        email = self.extract_email(person)
-        if person_details:
-            # Try to get email from person_details too
-            email = email or self.extract_email(person_details)
-        
-        # Extract name
+        # Extract fields matching n8n Edit Fields2 node exactly
         name = person.get("name", "")
-        if not name:
+        linkedin_url = person.get("linkedin_url", "")
+        title = person.get("title", "")
+        formatted_address = person.get("formatted_address", "")
+        
+        # Extract organization fields
+        company_name = organization.get("name", "")
+        company_website = organization.get("website_url", "")
+        company_linkedin = organization.get("linkedin_url", "")
+        company_blog = organization.get("blog_url", "")
+        company_angellist = organization.get("angellist_url", "")
+        company_phone = organization.get("phone", "")
+        
+        # Extract email (already extracted in search_people, but keep for safety)
+        email = self.extract_email(person)
+        if not email and person_details:
+            email = self.extract_email(person_details)
+        
+        # Split name into first/last
+        name_parts = name.split(" ", 1) if name else ["", ""]
+        first_name = name_parts[0] if len(name_parts) > 0 else ""
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+        
+        # If no name, try first_name/last_name fields
+        if not first_name:
             first_name = person.get("first_name", "")
+        if not last_name:
             last_name = person.get("last_name", "")
-            name = f"{first_name} {last_name}".strip()
         
         lead = LeadCreate(
             apollo_id=str(person.get("id", "")),
-            first_name=person.get("first_name"),
-            last_name=person.get("last_name"),
+            first_name=first_name,
+            last_name=last_name,
             email=email,
-            title=person.get("title"),
-            company_name=organization.get("name"),
-            company_domain=organization.get("primary_domain"),
-            company_website=organization.get("website_url"),
-            company_linkedin_url=organization.get("linkedin_url"),
-            company_blog_url=organization.get("blog_url"),
-            company_angellist_url=organization.get("angellist_url"),
+            title=title,
+            company_name=company_name,
+            company_domain=organization.get("primary_domain") or organization.get("website_url", "").replace("https://", "").replace("http://", "").split("/")[0],
+            company_website=company_website,
+            company_linkedin_url=company_linkedin,
+            company_blog_url=company_blog,
+            company_angellist_url=company_angellist,
             company_employee_size=organization.get("estimated_num_employees"),
             company_country=self._extract_country(organization),
-            company_industry=organization.get("industry"),
+            company_industry=organization.get("industry") or apollo_data.get("_industry_filter"),
             company_sic_code=organization.get("sic_code"),
-            linkedin_url=person.get("linkedin_url"),
-            phone=self._extract_phone(person, organization),
+            linkedin_url=linkedin_url,
+            phone=company_phone or self._extract_phone(person, organization),
             location=person.get("city") or organization.get("city"),
-            formatted_address=person.get("formatted_address"),
-            is_c_suite=self._is_c_suite(person.get("title", "")),
+            formatted_address=formatted_address,
+            is_c_suite=self._is_c_suite(title),
             apollo_data=person,
             status="new"
         )
