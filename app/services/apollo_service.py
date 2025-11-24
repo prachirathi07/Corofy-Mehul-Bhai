@@ -62,11 +62,16 @@ class ApolloService:
 
         for page in range(1, total_pages + 1):
             try:
-                logger.info(f"Apollo: Fetching page {page}/{total_pages}")
+                # Calculate how many leads we still need
+                leads_needed = total_leads_wanted - len(all_people)
+                # Request only what we need, capped at 100 (max per page)
+                current_per_page = min(leads_needed, 100)
+                
+                logger.info(f"Apollo: Fetching page {page}/{total_pages} (Requesting {current_per_page} leads)")
 
                 payload = {
                     "page": page,
-                    "per_page": leads_per_page,
+                    "per_page": current_per_page,
                     "person_titles": c_suites,
                     "person_locations": countries or [],
                     "organization_sic_codes": sic_codes or [],
@@ -91,8 +96,9 @@ class ApolloService:
                     )
 
                 if response.status_code == 403:
-                    logger.error("❌ Apollo 403 Forbidden — Likely free plan and this search requires credits.")
-                    return []
+                    error_msg = "Apollo API 403 Forbidden — Likely insufficient credits or free plan limit reached."
+                    logger.error(f"❌ {error_msg}")
+                    raise Exception(error_msg)
 
                 response.raise_for_status()
                 
@@ -112,7 +118,7 @@ class ApolloService:
                 continue
         
         logger.info(f"Apollo: Total leads collected: {len(all_people)}")
-        return all_people
+        return all_people[:total_leads_wanted]
 
     def parse_apollo_response(self, person: Dict[str, Any]) -> Dict[str, Any]:
         """ Parse Apollo person data into scraped_data format """

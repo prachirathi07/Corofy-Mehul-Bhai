@@ -73,19 +73,40 @@ class SimplifiedEmailTrackingService:
     def get_next_batch_leads(self) -> list:
         """
         Get the next batch of unprocessed leads.
-        Returns leads that haven't been processed yet (email_processed = false or null).
+        Returns leads that haven't been processed yet.
+        Locks them immediately by setting status='processing'.
         """
         try:
             # Get unprocessed leads with valid emails
-            # Query for leads where email_processed is not true AND founder_email is not null/empty
-            result = self.db.table("scraped_data").select("*").is_("email_processed", "null").not_.is_("founder_email", "null").neq("founder_email", "").limit(self.batch_size).execute()
+            # Filter out already processing leads
+            result = self.db.table("scraped_data") \
+                .select("*") \
+                .is_("email_processed", "null") \
+                .neq("status", "processing") \
+                .not_.is_("founder_email", "null") \
+                .neq("founder_email", "") \
+                .limit(self.batch_size) \
+                .execute()
             
             # If no null records, try false records
             if not result.data or len(result.data) == 0:
-                result = self.db.table("scraped_data").select("*").eq("email_processed", False).not_.is_("founder_email", "null").neq("founder_email", "").limit(self.batch_size).execute()
+                result = self.db.table("scraped_data") \
+                    .select("*") \
+                    .eq("email_processed", False) \
+                    .neq("status", "processing") \
+                    .not_.is_("founder_email", "null") \
+                    .neq("founder_email", "") \
+                    .limit(self.batch_size) \
+                    .execute()
             
             leads = result.data if result.data else []
-            logger.info(f"📋 Found {len(leads)} unprocessed leads for next batch")
+            
+            if leads:
+                # LOCK LEADS IMMEDIATELY
+                lead_ids = [l["id"] for l in leads]
+                self.db.table("scraped_data").update({"status": "processing"}).in_("id", lead_ids).execute()
+                logger.info(f"🔒 Locked {len(leads)} leads for processing")
+                
             return leads
             
         except Exception as e:

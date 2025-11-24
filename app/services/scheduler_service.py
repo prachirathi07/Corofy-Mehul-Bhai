@@ -28,7 +28,7 @@ class SchedulerService:
         # Job 1: Process Email Queue (Every 15 minutes)
         self.scheduler.add_job(
             self._run_process_email_queue,
-            trigger=IntervalTrigger(minutes=15),
+            trigger=IntervalTrigger(hours=2),
             id="process_email_queue",
             name="Process Email Queue",
             replace_existing=True

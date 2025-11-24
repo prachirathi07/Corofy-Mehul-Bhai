@@ -291,7 +291,12 @@ async def scrape_leads(request: ScrapeLeadsRequest, db: Client = Depends(get_db)
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
         db.table("apollo_searches").update({"status": "failed"}).eq("id", search_id).execute()
-        raise HTTPException(status_code=500, detail=str(e))
+        
+        error_msg = str(e)
+        if "Apollo API 403" in error_msg:
+             raise HTTPException(status_code=403, detail=error_msg)
+             
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @router.post("/send-emails", response_model=dict)
 async def send_emails_to_leads_endpoint(request: SendEmailsRequest, db: Client = Depends(get_db)):
