@@ -134,7 +134,7 @@ def format_error_response(error: Exception, service_name: str, status_code: Opti
     
     Args:
         error: Exception object
-        service_name: Name of the service (e.g., "OpenAI", "Apollo", "Apify")
+        service_name: Name of the service (e.g., "OpenAI", "Apollo")
         status_code: HTTP status code if available
         error_text: Error text/response if available
         

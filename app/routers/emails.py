@@ -50,9 +50,16 @@ async def generate_email(
 
 @router.get("/queue")
 async def get_email_queue(db: Client = Depends(get_db)):
-    """Get pending emails in queue"""
-    result = db.table("email_queue").select("*").eq("status", "pending").order("scheduled_time").execute()
-    return result.data
+    """Get pending emails in queue (using scheduled_emails view)"""
+    try:
+        # Use the view created in migration
+        result = db.table("scheduled_emails").select("*").order("scheduled_time").execute()
+        return result.data
+    except Exception as e:
+        # Fallback to direct query if view doesn't exist
+        logger.warning(f"View scheduled_emails might not exist, falling back to scraped_data: {e}")
+        result = db.table("scraped_data").select("*").eq("mail_status", "scheduled").order("scheduled_time").execute()
+        return result.data
 
 @router.get("/sent")
 async def get_sent_emails(
@@ -61,26 +68,43 @@ async def get_sent_emails(
     lead_id: Optional[UUID] = None,
     db: Client = Depends(get_db)
 ):
-    """Get all sent emails"""
-    query = db.table("emails_sent").select("*")
-    
-    if lead_id:
-        query = query.eq("lead_id", str(lead_id))
-    
-    query = query.order("sent_at", desc=True).range(skip, skip + limit - 1)
-    result = query.execute()
-    
-    return result.data
+    """Get all sent emails (using sent_emails_view)"""
+    try:
+        query = db.table("sent_emails_view").select("*")
+        
+        if lead_id:
+            query = query.eq("lead_id", str(lead_id))
+        
+        query = query.order("sent_at", desc=True).range(skip, skip + limit - 1)
+        result = query.execute()
+        
+        return result.data
+    except Exception as e:
+        # Fallback
+        logger.warning(f"View sent_emails_view might not exist, falling back to scraped_data: {e}")
+        query = db.table("scraped_data").select("*").in_("mail_status", ["email_sent", "sent", "reply_received", "2nd followup sent"])
+        if lead_id:
+            query = query.eq("id", str(lead_id))
+        query = query.order("sent_at", desc=True).range(skip, skip + limit - 1)
+        result = query.execute()
+        return result.data
 
 @router.get("/sent/{email_id}")
 async def get_sent_email(email_id: UUID, db: Client = Depends(get_db)):
-    """Get a specific sent email"""
-    result = db.table("emails_sent").select("*").eq("id", str(email_id)).execute()
-    
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Email not found")
-    
-    return result.data[0]
+    """Get a specific sent email (by lead_id since 1:1 mapping now)"""
+    # Note: email_id is interpreted as lead_id in the simplified schema
+    try:
+        result = db.table("sent_emails_view").select("*").eq("lead_id", str(email_id)).execute()
+        
+        if not result.data:
+            # Try scraped_data directly
+            result = db.table("scraped_data").select("*").eq("id", str(email_id)).execute()
+            if not result.data:
+                raise HTTPException(status_code=404, detail="Email/Lead not found")
+        
+        return result.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/send/{lead_id}")
 async def send_email_to_lead(
@@ -147,38 +171,31 @@ async def process_email_queue(db: Client = Depends(get_db)):
 @router.post("/reset-sent-status")
 async def reset_sent_emails_status(db: Client = Depends(get_db)):
     """
-    Delete all emails with status 'SENT' from emails_sent table
+    Reset all emails with status 'email_sent' or 'sent' to 'new' in scraped_data
     This allows re-sending emails that were previously marked as sent
     """
     try:
-        # Find all emails with status 'SENT'
-        sent_emails = (
-            db.table("emails_sent")
-            .select("id")
-            .eq("status", "SENT")
-            .execute()
-        )
+        # Update scraped_data
+        # Set mail_status = 'new', sent_at = null, etc.
+        update_data = {
+            "mail_status": "new",
+            "sent_at": None,
+            "gmail_message_id": None,
+            "gmail_thread_id": None,
+            "error_message": None,
+            "retry_count": 0
+        }
         
-        if not sent_emails.data:
-            return {
-                "success": True,
-                "message": "No emails with 'SENT' status found",
-                "deleted_count": 0
-            }
+        result = db.table("scraped_data").update(update_data).in_("mail_status", ["email_sent", "sent", "failed"]).execute()
         
-        email_ids = [email["id"] for email in sent_emails.data]
-        count = len(email_ids)
+        count = len(result.data) if result.data else 0
         
-        # Delete all sent emails
-        for email_id in email_ids:
-            db.table("emails_sent").delete().eq("id", email_id).execute()
-        
-        logger.info(f"✅ Deleted {count} emails with 'SENT' status")
+        logger.info(f"✅ Reset {count} emails to 'new' status")
         
         return {
             "success": True,
-            "message": f"Successfully deleted {count} emails with 'SENT' status",
-            "deleted_count": count
+            "message": f"Successfully reset {count} emails to 'new' status",
+            "reset_count": count
         }
     
     except Exception as e:

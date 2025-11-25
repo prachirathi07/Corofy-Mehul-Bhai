@@ -1,17 +1,19 @@
 """
 Dead Letter Queue (DLQ) service for managing failed email attempts.
 Automatically retries failed emails with exponential backoff.
+Rewritten to use scraped_data table directly in the simplified architecture.
 """
 
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from supabase import Client
 import logging
+import pytz
 
 logger = logging.getLogger(__name__)
 
 class DeadLetterQueueService:
-    """Service for managing failed email attempts and retries"""
+    """Service for managing failed email attempts and retries using scraped_data"""
     
     def __init__(self, db: Client):
         self.db = db
@@ -28,45 +30,40 @@ class DeadLetterQueueService:
         error_type: str = "unknown"
     ) -> Optional[str]:
         """
-        Add a failed email to the dead letter queue.
+        Mark an email as failed in scraped_data and schedule retry.
         
         Args:
             lead_id: Lead UUID
-            email_to: Recipient email
-            subject: Email subject
-            body: Email body
+            email_to: Recipient email (unused, using lead_id)
+            subject: Email subject (unused, using lead_id)
+            body: Email body (unused, using lead_id)
             error: Exception that caused the failure
-            error_type: Type of error (network, validation, api_error, etc.)
+            error_type: Type of error
         
         Returns:
-            DLQ entry ID or None if failed
+            Lead ID if successful, None otherwise
         """
         try:
             # Calculate next retry time (1 hour from now for first attempt)
             next_retry = datetime.utcnow() + timedelta(seconds=self.retry_delays[0])
             
-            dlq_data = {
-                "lead_id": lead_id,
-                "email_to": email_to,
-                "subject": subject,
-                "body": body,
-                "error_message": str(error),
-                "error_type": error_type,
-                "attempt_count": 1,
-                "max_attempts": self.max_attempts,
-                "status": "pending",
+            # Update scraped_data
+            # We use retry_count = 1 for the first failure
+            update_data = {
+                "mail_status": "failed",
+                "error_message": f"{error_type}: {str(error)}",
+                "retry_count": 1,
                 "next_retry_at": next_retry.isoformat()
             }
             
-            result = self.db.table("failed_emails").insert(dlq_data).execute()
-            dlq_id = result.data[0]["id"] if result.data else None
+            self.db.table("scraped_data").update(update_data).eq("id", lead_id).execute()
             
             logger.info(
-                f"📥 Added failed email to DLQ: {email_to} "
+                f"📥 Added failed email to DLQ (scraped_data): Lead {lead_id} "
                 f"(Error: {error_type}, Retry at: {next_retry})"
             )
             
-            return dlq_id
+            return lead_id
             
         except Exception as e:
             logger.error(f"Failed to add email to DLQ: {e}", exc_info=True)
@@ -75,15 +72,25 @@ class DeadLetterQueueService:
     async def retry_failed_emails(self) -> Dict[str, Any]:
         """
         Retry all pending failed emails that are ready for retry.
+        Queries scraped_data for mail_status='failed' and next_retry_at <= now.
         
         Returns:
             Dict with retry statistics
         """
         try:
-            logger.info("🔄 Processing dead letter queue...")
+            logger.info("🔄 Processing dead letter queue (scraped_data)...")
+            
+            now = datetime.utcnow().isoformat()
             
             # Get emails ready for retry
-            result = self.db.table("retry_ready_emails").select("*").execute()
+            # mail_status = 'failed' AND next_retry_at <= now
+            result = (
+                self.db.table("scraped_data")
+                .select("*")
+                .eq("mail_status", "failed")
+                .lte("next_retry_at", now)
+                .execute()
+            )
             
             if not result.data:
                 logger.info("📭 No emails ready for retry")
@@ -105,67 +112,74 @@ class DeadLetterQueueService:
             from app.services.email_sending_service import EmailSendingService
             email_service = EmailSendingService(self.db)
             
-            for email_entry in retry_emails:
+            for lead in retry_emails:
                 try:
-                    dlq_id = email_entry["id"]
-                    lead_id = email_entry["lead_id"]
-                    attempt_count = email_entry["attempt_count"]
+                    lead_id = lead["id"]
+                    retry_count = lead.get("retry_count", 0) or 0
                     
-                    # Mark as retrying
-                    self._update_status(dlq_id, "retrying")
+                    # Mark as processing/retrying (optional, but good for locking)
+                    # We can just let EmailSendingService handle the update to 'email_sent' or 'failed'
                     
                     # Attempt to send email
-                    result = await email_service._send_email_immediately(
+                    # We need to regenerate email content or use what's stored?
+                    # EmailSendingService.send_email_to_lead generates content.
+                    # Let's use that.
+                    
+                    logger.info(f"🔄 Retrying lead {lead_id} (Attempt {retry_count + 1})")
+                    
+                    result = await email_service.send_email_to_lead(
                         lead_id=lead_id,
-                        lead_email=email_entry["email_to"],
-                        subject=email_entry["subject"],
-                        body=email_entry["body"],
-                        email_type="retry",
-                        is_personalized=True,
-                        company_website_used=True
+                        email_type="initial" # Assuming initial for now, could be stored in DB
                     )
                     
                     processed += 1
                     
                     if result.get("success"):
-                        # Success - mark as resolved
-                        self._mark_resolved(dlq_id)
+                        # Success! EmailSendingService updates mail_status to 'email_sent'
                         succeeded += 1
-                        logger.info(f"✅ DLQ retry succeeded: {email_entry['email_to']}")
+                        logger.info(f"✅ DLQ retry succeeded for lead {lead_id}")
                     else:
-                        # Failed - increment attempt and schedule next retry
-                        new_attempt_count = attempt_count + 1
+                        # Failed again
+                        new_retry_count = retry_count + 1
+                        error_msg = result.get("error", "Unknown error")
                         
-                        if new_attempt_count >= self.max_attempts:
-                            # Max attempts reached - mark as permanently failed
-                            self._mark_permanently_failed(dlq_id, result.get("error"))
+                        if new_retry_count >= self.max_attempts:
+                            # Max attempts reached - mark as permanently failed (bounced or just failed with no retry)
+                            self.db.table("scraped_data").update({
+                                "mail_status": "bounced", # Using 'bounced' as permanent failure state
+                                "error_message": f"Max retries reached. Last error: {error_msg}",
+                                "retry_count": new_retry_count,
+                                "next_retry_at": None # No more retries
+                            }).eq("id", lead_id).execute()
+                            
                             failed += 1
                             logger.warning(
-                                f"❌ DLQ max attempts reached: {email_entry['email_to']} "
-                                f"({new_attempt_count}/{self.max_attempts})"
+                                f"❌ DLQ max attempts reached for lead {lead_id} "
+                                f"({new_retry_count}/{self.max_attempts})"
                             )
                         else:
-                            # Schedule next retry with exponential backoff
-                            delay_index = min(new_attempt_count - 1, len(self.retry_delays) - 1)
+                            # Schedule next retry
+                            delay_index = min(new_retry_count - 1, len(self.retry_delays) - 1)
                             next_retry = datetime.utcnow() + timedelta(
                                 seconds=self.retry_delays[delay_index]
                             )
                             
-                            self._schedule_retry(
-                                dlq_id,
-                                new_attempt_count,
-                                next_retry,
-                                result.get("error")
-                            )
+                            self.db.table("scraped_data").update({
+                                "mail_status": "failed",
+                                "error_message": error_msg,
+                                "retry_count": new_retry_count,
+                                "next_retry_at": next_retry.isoformat()
+                            }).eq("id", lead_id).execute()
+                            
                             failed += 1
                             logger.info(
-                                f"⏳ DLQ retry failed, rescheduled: {email_entry['email_to']} "
-                                f"(Attempt {new_attempt_count}/{self.max_attempts}, "
+                                f"⏳ DLQ retry failed, rescheduled lead {lead_id} "
+                                f"(Attempt {new_retry_count}/{self.max_attempts}, "
                                 f"Next retry: {next_retry})"
                             )
                 
                 except Exception as e:
-                    logger.error(f"Error retrying DLQ email {email_entry.get('id')}: {e}")
+                    logger.error(f"Error retrying DLQ lead {lead.get('id')}: {e}")
                     failed += 1
             
             logger.info(
@@ -190,94 +204,24 @@ class DeadLetterQueueService:
                 "failed": 0
             }
     
-    def _update_status(self, dlq_id: str, status: str):
-        """Update DLQ entry status"""
-        try:
-            self.db.table("failed_emails").update({
-                "status": status,
-                "last_attempt_at": datetime.utcnow().isoformat()
-            }).eq("id", dlq_id).execute()
-        except Exception as e:
-            logger.error(f"Error updating DLQ status: {e}")
-    
-    def _mark_resolved(self, dlq_id: str):
-        """Mark DLQ entry as successfully resolved"""
-        try:
-            self.db.table("failed_emails").update({
-                "status": "resolved",
-                "resolved_at": datetime.utcnow().isoformat()
-            }).eq("id", dlq_id).execute()
-        except Exception as e:
-            logger.error(f"Error marking DLQ as resolved: {e}")
-    
-    def _mark_permanently_failed(self, dlq_id: str, error_message: Optional[str]):
-        """Mark DLQ entry as permanently failed (max attempts reached)"""
-        try:
-            update_data = {
-                "status": "failed",
-                "last_attempt_at": datetime.utcnow().isoformat()
-            }
-            if error_message:
-                update_data["error_message"] = error_message
-            
-            self.db.table("failed_emails").update(update_data).eq("id", dlq_id).execute()
-        except Exception as e:
-            logger.error(f"Error marking DLQ as permanently failed: {e}")
-    
-    def _schedule_retry(
-        self,
-        dlq_id: str,
-        attempt_count: int,
-        next_retry: datetime,
-        error_message: Optional[str]
-    ):
-        """Schedule next retry attempt"""
-        try:
-            update_data = {
-                "status": "pending",
-                "attempt_count": attempt_count,
-                "next_retry_at": next_retry.isoformat(),
-                "last_attempt_at": datetime.utcnow().isoformat()
-            }
-            if error_message:
-                update_data["error_message"] = error_message
-            
-            self.db.table("failed_emails").update(update_data).eq("id", dlq_id).execute()
-        except Exception as e:
-            logger.error(f"Error scheduling DLQ retry: {e}")
-    
     def get_dlq_stats(self) -> Dict[str, Any]:
-        """Get DLQ statistics"""
+        """Get DLQ statistics from scraped_data"""
         try:
-            result = self.db.table("failed_emails_summary").select("*").execute()
+            # Count failed emails
+            failed_result = self.db.table("scraped_data").select("id", count="exact").eq("mail_status", "failed").execute()
+            total_failed = failed_result.count if failed_result.count else 0
             
-            stats = {
-                "total_failed": 0,
-                "pending_retry": 0,
-                "permanently_failed": 0,
-                "resolved": 0,
-                "by_error_type": {}
+            # Count bounced (permanently failed)
+            bounced_result = self.db.table("scraped_data").select("id", count="exact").eq("mail_status", "bounced").execute()
+            total_bounced = bounced_result.count if bounced_result.count else 0
+            
+            return {
+                "total_failed": total_failed,
+                "pending_retry": total_failed, # All 'failed' are pending retry unless max reached (which moves to bounced)
+                "permanently_failed": total_bounced,
+                "resolved": 0, # Hard to track resolved historically without separate table
+                "by_error_type": {} # Not easily available without group by query
             }
-            
-            for row in result.data:
-                status = row["status"]
-                error_type = row["error_type"]
-                count = row["count"]
-                
-                if status == "pending":
-                    stats["pending_retry"] += count
-                elif status == "failed":
-                    stats["permanently_failed"] += count
-                elif status == "resolved":
-                    stats["resolved"] += count
-                
-                stats["total_failed"] += count
-                
-                if error_type not in stats["by_error_type"]:
-                    stats["by_error_type"][error_type] = 0
-                stats["by_error_type"][error_type] += count
-            
-            return stats
             
         except Exception as e:
             logger.error(f"Error getting DLQ stats: {e}")

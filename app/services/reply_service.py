@@ -51,17 +51,24 @@ class ReplyService:
                     "analyzed": 0
                 }
             
-            # Get all sent emails with thread_id that haven't been checked for replies
-            # Check emails_sent table for emails with gmail_thread_id
-            sent_emails = self.db.table("emails_sent").select("*").not_.is_("gmail_thread_id", "null").execute()
+            # Get all sent emails with thread_id that haven't been marked as replied
+            # Check scraped_data table
+            # We look for leads that have been sent an email but haven't replied yet
+            sent_leads = (
+                self.db.table("scraped_data")
+                .select("*")
+                .not_.is_("gmail_thread_id", "null")
+                .in_("mail_status", ["email_sent", "sent", "2nd followup sent"])
+                .execute()
+            )
             
-            if not sent_emails.data:
+            if not sent_leads.data:
                 return {
                     "success": True,
                     "checked": 0,
                     "new_replies": 0,
                     "analyzed": 0,
-                    "message": "No emails with thread IDs to check"
+                    "message": "No sent leads with thread IDs to check"
                 }
             
             checked = 0
@@ -69,43 +76,16 @@ class ReplyService:
             analyzed = 0
             skipped = 0
             
-            for email_sent in sent_emails.data:
+            for lead in sent_leads.data:
                 try:
-                    email_sent_id = email_sent["id"]
-                    lead_id = email_sent["lead_id"]
-                    thread_id = email_sent.get("gmail_thread_id")
+                    lead_id = lead["id"]
+                    thread_id = lead.get("gmail_thread_id")
+                    original_message_id = lead.get("gmail_message_id")
                     
                     if not thread_id:
                         continue
                     
-                    # Check mail_status - skip if already reply_received
-                    lead_result = self.db.table("scraped_data").select("*").eq("id", lead_id).execute()
-                    if not lead_result.data:
-                        continue
-                    
-                    lead_data = lead_result.data[0]
-                    mail_status = lead_data.get("mail_status", "new")
-                    
-                    # Skip if already analyzed (reply_received)
-                    if mail_status == "reply_received":
-                        skipped += 1
-                        logger.debug(f"Skipping lead {lead_id} - mail_status is already 'reply_received'")
-                        continue
-                    
                     checked += 1
-                    
-                    # Check if reply already exists in email_replies table
-                    existing_reply = self.db.table("email_replies").select("*").eq("email_sent_id", email_sent_id).execute()
-                    
-                    if existing_reply.data and len(existing_reply.data) > 0:
-                        # Reply already detected - check if analyzed
-                        if mail_status != "reply_received":
-                            # Reply exists but not analyzed - analyze it
-                            reply_data = existing_reply.data[0]
-                            analysis_result = await self._analyze_reply(reply_data, lead_id)
-                            if analysis_result.get("success"):
-                                analyzed += 1
-                        continue
                     
                     # Get thread messages from Gmail
                     thread_messages = self.gmail_service.get_thread_messages(thread_id)
@@ -114,53 +94,57 @@ class ReplyService:
                         continue
                     
                     # Find replies (messages that are not the original sent email)
-                    original_message_id = email_sent.get("gmail_message_id")
                     replies = []
                     
                     for message in thread_messages:
                         msg_id = message.get("id")
-                        # Skip the original message
-                        if msg_id == original_message_id:
+                        # Skip the original message if we know it
+                        if original_message_id and msg_id == original_message_id:
                             continue
                         
                         # Check if this is a reply (has headers indicating it's a reply)
                         headers = message.get("payload", {}).get("headers", [])
                         in_reply_to = None
-                        for header in headers:
-                            if header.get("name", "").lower() == "in-reply-to":
-                                in_reply_to = header.get("value")
-                                break
+                        from_email = None
                         
-                        if in_reply_to or msg_id != original_message_id:
+                        for header in headers:
+                            name = header.get("name", "").lower()
+                            if name == "in-reply-to":
+                                in_reply_to = header.get("value")
+                            elif name == "from":
+                                from_email = header.get("value")
+                        
+                        # Simple check: if it's not from us (assuming we are not the sender of the reply)
+                        # Ideally we should check if from_email is NOT our email.
+                        # But for now, if it's in the thread and not the original message, treat as reply candidate.
+                        # Better check: if in_reply_to is present, it's likely a reply.
+                        
+                        if in_reply_to or (original_message_id and msg_id != original_message_id):
                             replies.append(message)
                     
-                    # Process new replies
-                    for reply_message in replies:
-                        msg_id = reply_message.get("id")
+                    if not replies:
+                        continue
                         
-                        # Check if this reply is already stored
-                        existing = self.db.table("email_replies").select("*").eq("gmail_message_id", msg_id).execute()
-                        if existing.data:
-                            continue
+                    # We found replies!
+                    # Get the latest reply
+                    latest_reply = replies[-1]
+                    
+                    # Extract reply data
+                    reply_data = self._extract_reply_data(latest_reply, lead_id)
+                    
+                    if reply_data:
+                        new_replies += 1
                         
-                        # Extract reply data
-                        reply_data = self._extract_reply_data(reply_message, email_sent_id, lead_id)
-                        
-                        if reply_data:
-                            # Store reply
-                            self.db.table("email_replies").insert(reply_data).execute()
-                            new_replies += 1
-                            
-                            # Analyze the reply
-                            analysis_result = await self._analyze_reply(reply_data, lead_id)
-                            if analysis_result.get("success"):
-                                analyzed += 1
+                        # Analyze the reply
+                        analysis_result = await self._analyze_reply(reply_data, lead_id)
+                        if analysis_result.get("success"):
+                            analyzed += 1
                 
                 except Exception as e:
-                    logger.error(f"Error checking replies for email {email_sent.get('id')}: {e}", exc_info=True)
+                    logger.error(f"Error checking replies for lead {lead.get('id')}: {e}", exc_info=True)
                     continue
             
-            logger.info(f"📧 Reply check completed: {checked} checked, {new_replies} new replies, {analyzed} analyzed, {skipped} skipped (already reply_received)")
+            logger.info(f"📧 Reply check completed: {checked} checked, {new_replies} new replies, {analyzed} analyzed")
             
             return {
                 "success": True,
@@ -180,17 +164,9 @@ class ReplyService:
                 "analyzed": 0
             }
     
-    def _extract_reply_data(self, message: Dict[str, Any], email_sent_id: str, lead_id: str) -> Optional[Dict[str, Any]]:
+    def _extract_reply_data(self, message: Dict[str, Any], lead_id: str) -> Optional[Dict[str, Any]]:
         """
         Extract reply data from Gmail message
-        
-        Args:
-            message: Gmail message object
-            email_sent_id: ID of the sent email
-            lead_id: Lead ID
-            
-        Returns:
-            Dict with reply data or None
         """
         try:
             payload = message.get("payload", {})
@@ -230,7 +206,6 @@ class ReplyService:
                 reply_date_iso = datetime.utcnow().isoformat()
             
             return {
-                "email_sent_id": email_sent_id,
                 "lead_id": lead_id,
                 "gmail_message_id": message.get("id"),
                 "gmail_thread_id": message.get("threadId"),
@@ -247,12 +222,6 @@ class ReplyService:
     def _extract_message_body(self, payload: Dict[str, Any]) -> str:
         """
         Extract message body from Gmail payload
-        
-        Args:
-            payload: Gmail message payload
-            
-        Returns:
-            Message body as string
         """
         try:
             body = ""
@@ -285,13 +254,6 @@ class ReplyService:
     async def _analyze_reply(self, reply_data: Dict[str, Any], lead_id: str) -> Dict[str, Any]:
         """
         Analyze a reply using OpenAI to get summary and priority
-        
-        Args:
-            reply_data: Reply data dict
-            lead_id: Lead ID
-            
-        Returns:
-            Dict with analysis results
         """
         try:
             reply_body = reply_data.get("reply_body", "")
@@ -339,8 +301,6 @@ Return your response as JSON with keys: "summary" and "priority"."""
                     priority = "medium"
                 
                 # Update scraped_data with summary and priority
-                # Note: reply_priority column exists, storing summary in mail_replies
-                # If you need a separate summary column, add it to the database schema
                 update_data = {
                     "mail_status": "reply_received",
                     "reply_priority": priority,
@@ -373,4 +333,3 @@ Return your response as JSON with keys: "summary" and "priority"."""
         except Exception as e:
             logger.error(f"Error in _analyze_reply: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
-

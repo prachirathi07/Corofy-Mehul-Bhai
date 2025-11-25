@@ -76,7 +76,7 @@ class WebhookService:
                 logger.info(f"📥 WEBHOOK RESPONSE DATA: {response_data}")
                 
                 # Check if n8n confirms email was sent
-                # Improved response parsing for new n8n workflow format
+                # REQUIRED: n8n workflow MUST return message_id and thread_id from Gmail API
                 is_success = False
                 message_id = None
                 thread_id = None
@@ -85,17 +85,25 @@ class WebhookService:
                 if response.status_code in [200, 201]:
                     # Check for explicit success flag in response
                     if response_data.get("success") == True:
-                        is_success = True
                         message_id = response_data.get("message_id")
                         thread_id = response_data.get("thread_id")
-                    # Fallback: check if message_id exists (indicates email was sent)
+                        if message_id and thread_id:
+                            is_success = True
+                        else:
+                            logger.warning(f"⚠️ Webhook returned success=True but missing message_id or thread_id")
+                    # Check if message_id exists (indicates email was sent)
                     elif response_data.get("message_id"):
-                        is_success = True
                         message_id = response_data.get("message_id")
                         thread_id = response_data.get("thread_id")
-                    # Legacy fallback: check for success indicators in message
-                    elif "success" in str(response_data).lower() or "sent" in str(response_data).lower():
-                        is_success = True
+                        if message_id:
+                            is_success = True
+                            if not thread_id:
+                                logger.warning(f"⚠️ Webhook returned message_id but missing thread_id")
+                    # If we get 200 but no message_id, the workflow needs to be fixed
+                    else:
+                        logger.error(f"❌ Webhook returned 200 but missing required fields. Response: {response_data}")
+                        logger.error(f"❌ n8n workflow MUST return message_id and thread_id from Gmail API response")
+                        logger.error(f"❌ Expected format: {{'success': true, 'message_id': '...', 'thread_id': '...'}}")
                 
                 # Build webhook response with Gmail IDs if available
                 webhook_response = {

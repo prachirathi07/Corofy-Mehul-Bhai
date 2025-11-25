@@ -2,13 +2,12 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from app.services.apollo_service import ApolloService
-from app.services.apify_service import ApifyService
 from app.services.lead_scraper_factory import LeadScraperFactory
 from app.services.website_service import WebsiteService
 from app.services.email_personalization_service import EmailPersonalizationService
 from app.services.timezone_service import TimezoneService
 from app.services.simplified_email_tracking_service import SimplifiedEmailTrackingService
-from app.services.batch_tracking_service import BatchTrackingService
+# from app.services.batch_tracking_service import BatchTrackingService # REMOVED
 from app.services.dead_letter_queue_service import DeadLetterQueueService
 from app.core.database import get_db
 from app.models.apollo_search import ApolloSearchCreate
@@ -27,26 +26,31 @@ router = APIRouter()
 async def _send_emails_to_leads(lead_ids: List[str], db: Client):
     """
     Send emails to leads with batch tracking, DLQ, and timezone checks.
+    MAX 10 LEADS ENFORCED.
     """
     try:
+        # CRITICAL SAFETY CHECK: Enforce maximum 10 leads
+        MAX_LEADS = 10
+        if len(lead_ids) > MAX_LEADS:
+            logger.warning(f"⚠️ CRITICAL: Received {len(lead_ids)} lead_ids, limiting to {MAX_LEADS} for safety")
+            lead_ids = lead_ids[:MAX_LEADS]
+        
         logger.info("=" * 80)
         logger.info(f"🚀 STARTING EMAIL SENDING PROCESS for {len(lead_ids)} leads")
         logger.info("=" * 80)
         
         # Initialize services
         tracking_service = SimplifiedEmailTrackingService(db, batch_size=10)
-        batch_tracker = BatchTrackingService(db)
+        # Initialize services
+        tracking_service = SimplifiedEmailTrackingService(db, batch_size=10)
+        # batch_tracker = BatchTrackingService(db) # REMOVED
         dlq_service = DeadLetterQueueService(db)
         timezone_service = TimezoneService()
         website_service = WebsiteService(db)
         email_service = EmailPersonalizationService(db)
         
-        # Create batch tracking record
-        batch_id = batch_tracker.create_batch(
-            total_leads=len(lead_ids),
-            metadata={"batch_type": "daily_email_send", "batch_size": 10}
-        )
-        logger.info(f"📊 Created batch tracking: {batch_id}")
+        # Batch tracking removed - using logging only
+        logger.info(f"📊 Processing batch of {len(lead_ids)} leads")
         
         # Get batch info
         send_check = tracking_service.can_send_today()
@@ -157,15 +161,9 @@ async def _send_emails_to_leads(lead_ids: List[str], db: Client):
                 processed += 1
                 processed_lead_ids.append(lead_id)
                 
-                # Update batch progress
+                # Update batch progress - LOGGING ONLY
                 if processed % 5 == 0:
-                    batch_tracker.update_progress(
-                        batch_id=batch_id,
-                        processed=processed,
-                        success=emails_sent_count,
-                        failed=failed,
-                        skipped=skipped
-                    )
+                    logger.info(f"📊 Progress: {processed}/{len(lead_ids)} processed, {emails_sent_count} sent, {failed} failed")
                 
                 # Rate limiting
                 if not should_queue:
@@ -189,8 +187,8 @@ async def _send_emails_to_leads(lead_ids: List[str], db: Client):
             emails_sent=emails_sent_count
         )
         
-        # Mark batch complete
-        batch_tracker.mark_complete(batch_id, success=True)
+        # Mark batch complete - LOGGING ONLY
+        logger.info(f"✅ Batch processing complete")
         
         logger.info("=" * 80)
         logger.info(f"📊 Email sending completed: {processed} processed, {emails_sent_count} sent")
@@ -207,7 +205,7 @@ class ScrapeLeadsRequest(BaseModel):
     c_suites: Opt[List[str]] = None
     industry: Opt[str] = None
     total_leads_wanted: int = 625
-    source: str = "apify"
+    source: str = "apollo"
 
 class SendEmailsRequest(BaseModel):
     lead_ids: Opt[List[str]] = None
@@ -215,25 +213,31 @@ class SendEmailsRequest(BaseModel):
 @router.post("/scrape", response_model=dict)
 async def scrape_leads(request: ScrapeLeadsRequest, db: Client = Depends(get_db)):
     """Scrape leads and store in scraped_data"""
-    # Implementation simplified for brevity but matching logic
-    # ... (keeping existing logic but targeting scraped_data)
-    # For now, I will just log and return success to avoid re-implementing the huge scraping logic block
-    # which is already in the file. Wait, I am overwriting the file.
-    # I MUST re-implement the scraping logic.
     
-    # ... (Re-implementing scraping logic)
-    # Due to length limits, I'll implement the core flow
+    source = request.source.lower() if request.source else "apollo"
     
-    source = request.source.lower() if request.source else "apify"
-    
-    # Create search record
+    # Create search record - only include fields that exist and are not None
     search_data = {
         "source": source,
-        "status": "pending",
-        "total_leads_wanted": request.total_leads_wanted
+        "status": "pending"
     }
-    search_insert = db.table("apollo_searches").insert(search_data).execute()
-    search_id = search_insert.data[0]["id"]
+    if request.total_leads_wanted is not None:
+        search_data["total_leads_wanted"] = request.total_leads_wanted
+    
+    try:
+        search_insert = db.table("apollo_searches").insert(search_data).execute()
+        search_id = search_insert.data[0]["id"] if search_insert.data else None
+        if not search_id:
+            raise HTTPException(status_code=500, detail="Failed to create search record")
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Failed to insert into apollo_searches: {error_msg}")
+        if "556" in error_msg or "Internal server error" in error_msg:
+            raise HTTPException(
+                status_code=503, 
+                detail="Database service error. Please check if the 'apollo_searches' table exists in Supabase and try again."
+            )
+        raise HTTPException(status_code=500, detail=f"Database error: {error_msg}")
     
     try:
         scraper = LeadScraperFactory.create_scraper(source)
@@ -247,42 +251,50 @@ async def scrape_leads(request: ScrapeLeadsRequest, db: Client = Depends(get_db)
                 sic_codes=request.sic_codes or [],
                 c_suites=request.c_suites,
                 industry=request.industry,
-                total_leads_wanted=request.total_leads_wanted
+                total_leads_wanted=request.total_leads_wanted,
+                enrich_leads=True  # ✅ Enable two-step enrichment
             )
-        elif source == "apify":
-            apify_response = await scraper.search_leads(
-                employee_size_min=request.employee_size_min,
-                employee_size_max=request.employee_size_max,
-                countries=request.countries,
-                sic_codes=request.sic_codes,
-                c_suites=request.c_suites,
-                industry=request.industry,
-                total_leads_wanted=request.total_leads_wanted
-            )
-            # Simplified parsing logic
-            all_leads = apify_response.get("leads", [])
-            if not all_leads and apify_response.get("items"):
-                all_leads = scraper.parse_apify_response(apify_response.get("items"))
+        else:
+            raise ValueError(f"Unsupported source: {source}. Only 'apollo' is supported.")
         
         # Store in scraped_data
+        # Define allowed fields that exist in scraped_data table
+        allowed_fields = {
+            "founder_name", "company_name", "position", "founder_email", "founder_linkedin",
+            "founder_address", "company_industry", "company_website", "company_linkedin",
+            "company_blogpost", "company_angellist", "company_phone", "company_country", "company_domain",
+            "is_verified", "followup_5_sent", "followup_10_sent", "mail_status", "reply_priority",
+            "thread_id", "mail_replies", "email_content", "email_subject",
+            "wait_initial_email", "wait_followup_5", "wait_followup_10", "apollo_search_id"
+        }
+        
         leads_to_insert = []
         for lead in all_leads:
             if isinstance(lead, dict):
                 lead_dict = lead
             else:
                 lead_dict = lead.model_dump(exclude_none=True)
-            lead_dict["apollo_search_id"] = search_id
-            leads_to_insert.append(lead_dict)
+            
+            # Filter to only include allowed fields
+            filtered_lead = {k: v for k, v in lead_dict.items() if k in allowed_fields}
+            filtered_lead["apollo_search_id"] = search_id
+            leads_to_insert.append(filtered_lead)
             
         if leads_to_insert:
             # Batch insert
             batch_size = 100
+            total_inserted = 0
             for i in range(0, len(leads_to_insert), batch_size):
                 batch = leads_to_insert[i:i + batch_size]
                 try:
-                    db.table("scraped_data").insert(batch).execute()
+                    insert_result = db.table("scraped_data").insert(batch).execute()
+                    inserted_count = len(insert_result.data) if insert_result.data else len(batch)
+                    total_inserted += inserted_count
+                    logger.info(f"✅ Inserted batch {i//batch_size + 1}: {inserted_count} leads stored in Supabase")
                 except Exception as e:
-                    logger.error(f"Insert failed: {e}")
+                    logger.error(f"❌ Insert failed for batch {i//batch_size + 1}: {e}")
+            
+            logger.info(f"✅ Total leads stored in Supabase: {total_inserted}/{len(leads_to_insert)}")
         
         db.table("apollo_searches").update({"status": "completed"}).eq("id", search_id).execute()
         
@@ -300,7 +312,7 @@ async def scrape_leads(request: ScrapeLeadsRequest, db: Client = Depends(get_db)
 
 @router.post("/send-emails", response_model=dict)
 async def send_emails_to_leads_endpoint(request: SendEmailsRequest, db: Client = Depends(get_db)):
-    """Send emails to leads (manual or automatic batch)"""
+    """Send emails to leads (manual or automatic batch) - MAX 10 LEADS"""
     try:
         lead_ids = request.lead_ids
         
@@ -321,6 +333,12 @@ async def send_emails_to_leads_endpoint(request: SendEmailsRequest, db: Client =
             
             if not lead_ids:
                 return {"success": True, "message": "No unprocessed leads found"}
+        
+        # SAFETY CHECK: Limit to maximum 10 leads
+        MAX_LEADS = 10
+        if len(lead_ids) > MAX_LEADS:
+            logger.warning(f"⚠️ Received {len(lead_ids)} lead_ids, limiting to {MAX_LEADS} for safety")
+            lead_ids = lead_ids[:MAX_LEADS]
         
         # Start background task
         task = asyncio.create_task(_send_emails_to_leads(lead_ids, db))
@@ -354,38 +372,11 @@ async def get_send_status(db: Client = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # Batch Tracking Endpoints
-@router.get("/batch/{batch_id}")
-async def get_batch_status(batch_id: str, db: Client = Depends(get_db)):
-    try:
-        tracker = BatchTrackingService(db)
-        return tracker.get_batch_status(batch_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/batches/active")
-async def get_active_batches(db: Client = Depends(get_db)):
-    try:
-        tracker = BatchTrackingService(db)
-        return tracker.get_active_batches()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/batches/recent")
-async def get_recent_batches(limit: int = 10, db: Client = Depends(get_db)):
-    try:
-        tracker = BatchTrackingService(db)
-        return tracker.get_recent_batches(limit)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/batch/{batch_id}/cancel")
-async def cancel_batch(batch_id: str, db: Client = Depends(get_db)):
-    try:
-        tracker = BatchTrackingService(db)
-        success = tracker.cancel_batch(batch_id)
-        return {"success": success}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# Batch Tracking Endpoints - REMOVED/DISABLED
+# @router.get("/batch/{batch_id}") ...
+# @router.get("/batches/active") ...
+# @router.get("/batches/recent") ...
+# @router.post("/batch/{batch_id}/cancel") ...
 
 @router.get("/", response_model=List[dict])
 async def get_leads(skip: int = 0, limit: int = 50, db: Client = Depends(get_db)):

@@ -20,7 +20,7 @@ CREATE TABLE apollo_searches (
     status VARCHAR(50) DEFAULT 'pending', -- pending, in_progress, completed, failed
     total_leads_found INTEGER DEFAULT 0,
     total_leads_wanted INTEGER DEFAULT 0,
-    source VARCHAR(50) DEFAULT 'apollo', -- 'apollo' or 'apify' - tracks which source was used
+    source VARCHAR(50) DEFAULT 'apollo', -- 'apollo' - tracks which source was used
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     completed_at TIMESTAMP WITH TIME ZONE

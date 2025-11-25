@@ -13,10 +13,6 @@ class Settings(BaseSettings):
     # Apollo API (Required for lead scraping)
     APOLLO_API_KEY: Optional[str] = None
     
-    # Apify API (Alternative lead scraping source)
-    APIFY_API_TOKEN: Optional[str] = None
-    APIFY_ACTOR_ID: Optional[str] = None  # Format: "username~actor-name"
-    
     # OpenAI (Required for email personalization)
     OPENAI_API_KEY: Optional[str] = None
     
@@ -44,6 +40,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"  # Ignore extra environment variables (like APIFY_* that were removed)
 
 settings = Settings()
 

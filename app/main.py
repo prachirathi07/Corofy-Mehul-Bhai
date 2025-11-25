@@ -60,11 +60,12 @@ app.add_middleware(
 app.add_middleware(RequestIDMiddleware)
 
 # Include routers
+# Include routers
 app.include_router(leads.router, prefix="/api/leads", tags=["leads"])
-app.include_router(campaigns.router, prefix="/api/campaigns", tags=["campaigns"])
+# app.include_router(campaigns.router, prefix="/api/campaigns", tags=["campaigns"]) # Disabled in simplified architecture
 app.include_router(emails.router, prefix="/api/emails", tags=["emails"])
 app.include_router(websites.router, prefix="/api/websites", tags=["websites"])
-app.include_router(followups.router, prefix="/api/followups", tags=["followups"])
+# app.include_router(followups.router, prefix="/api/followups", tags=["followups"]) # Disabled in simplified architecture
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 
 @app.get("/")
@@ -123,8 +124,10 @@ async def system_status():
         db = get_db()
         
         # Get counts
-        leads_count = len(db.table("scraped_data").select("id").execute().data)
-        pending_emails = len(db.table("email_queue").select("id").eq("status", "pending").execute().data)
+        leads_count = len(db.table("scraped_data").select("id", count="exact").execute().data)
+        # Check pending emails in scraped_data (mail_status='scheduled')
+        pending_result = db.table("scraped_data").select("id", count="exact").eq("mail_status", "scheduled").execute()
+        pending_emails = pending_result.count if pending_result.count else 0
         
         return {
             "success": True,

@@ -1,9 +1,8 @@
 """
-Factory for creating lead scraper services (Apollo or Apify)
+Factory for creating lead scraper services (Apollo only)
 """
-from typing import Optional, Union
+from typing import Optional
 from app.services.apollo_service import ApolloService
-from app.services.apify_service import ApifyService
 import logging
 
 logger = logging.getLogger(__name__)
@@ -14,15 +13,15 @@ class LeadScraperFactory:
     """
     
     @staticmethod
-    def create_scraper(source: str = "apify") -> Union[ApolloService, ApifyService]:
+    def create_scraper(source: str = "apollo") -> ApolloService:
         """
         Create a lead scraper service based on source
         
         Args:
-            source: "apollo" or "apify"
+            source: "apollo" (only supported source)
         
         Returns:
-            ApolloService or ApifyService instance
+            ApolloService instance
         """
         source = source.lower()
         
@@ -32,19 +31,8 @@ class LeadScraperFactory:
             except ValueError as e:
                 logger.error(f"Failed to create ApolloService: {e}")
                 raise
-        
-        elif source == "apify":
-            try:
-                logger.info("Attempting to create ApifyService...")
-                service = ApifyService()
-                logger.info("ApifyService created successfully")
-                return service
-            except ValueError as e:
-                logger.error(f"Failed to create ApifyService: {e}")
-                raise ValueError(f"Cannot use Apify: {e}. Please add APIFY_API_TOKEN and APIFY_ACTOR_ID to .env file.")
-        
         else:
-            raise ValueError(f"Unknown scraper source: {source}. Use 'apollo' or 'apify'")
+            raise ValueError(f"Unknown scraper source: {source}. Only 'apollo' is supported.")
     
     @staticmethod
     def get_available_sources() -> list:
@@ -54,12 +42,6 @@ class LeadScraperFactory:
         try:
             ApolloService()
             sources.append("apollo")
-        except:
-            pass
-        
-        try:
-            ApifyService()
-            sources.append("apify")
         except:
             pass
         

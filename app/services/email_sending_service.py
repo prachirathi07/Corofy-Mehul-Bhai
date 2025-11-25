@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from app.services.webhook_service import WebhookService
 from app.services.email_personalization_service import EmailPersonalizationService
 from app.services.timezone_service import TimezoneService
+from app.services.dead_letter_queue_service import DeadLetterQueueService
 from supabase import Client
 import logging
 import pytz
@@ -23,6 +24,7 @@ class EmailSendingService:
         self.webhook_service = WebhookService()
         self.email_personalization_service = EmailPersonalizationService(db)
         self.timezone_service = TimezoneService()
+        self.dlq_service = DeadLetterQueueService(db)
     
     async def send_email_to_lead(
         self,
@@ -113,44 +115,42 @@ class EmailSendingService:
             
             sent_at_time = datetime.utcnow().replace(tzinfo=pytz.UTC).isoformat()
 
-            # Only create email record if email was successfully sent
-            email_sent_id = None
-            if email_sent:
-                # Create email record with status "SENT"
-                insert_data = {
-                    "lead_id": lead_id,
-                    "email_to": lead_email,
-                    "email_subject": subject,
-                    "email_body": body,
-                    "email_type": email_type,
-                    "is_personalized": is_personalized,
-                    "company_website_used": company_website_used,
-                    "sent_at": sent_at_time,
-                    "status": "SENT"
-                }
-                # Only add webhook response fields if they exist
-                if webhook_response and isinstance(webhook_response, dict):
-                    if webhook_response.get("message_id"):
-                        insert_data["gmail_message_id"] = webhook_response.get("message_id")
-                    if webhook_response.get("thread_id"):
-                        insert_data["gmail_thread_id"] = webhook_response.get("thread_id")
-                
-                result_insert = self.db.table("emails_sent").insert(insert_data).execute()
-                email_sent_id = result_insert.data[0]["id"] if result_insert.data else None
-
             # Update lead status only if email was successfully sent
             if email_sent:
-                self.db.table("scraped_data").update({"status": "email_sent"}).eq("id", lead_id).execute()
+                update_data = {
+                    "mail_status": "email_sent",
+                    "sent_at": sent_at_time,
+                    "is_personalized": is_personalized,
+                    "company_website_used": company_website_used
+                }
+                
+                # Add webhook response fields if they exist
+                if webhook_response and isinstance(webhook_response, dict):
+                    if webhook_response.get("message_id"):
+                        update_data["gmail_message_id"] = webhook_response.get("message_id")
+                    if webhook_response.get("thread_id"):
+                        update_data["gmail_thread_id"] = webhook_response.get("thread_id")
+                
+                self.db.table("scraped_data").update(update_data).eq("id", lead_id).execute()
                 logger.info(f"✅ Email sent successfully via webhook to {lead_email} (Lead: {lead_id}) - Status: SENT")
             else:
                 logger.warning(f"❌ Email sending failed via webhook for {lead_email} (Lead: {lead_id}): {webhook_result.get('error')} - No record created")
+                # Add to DLQ if failed
+                await self.dlq_service.add_failed_email(
+                    lead_id=lead_id,
+                    email_to=lead_email,
+                    subject=subject,
+                    body=body,
+                    error=Exception(webhook_result.get("error", "Unknown error")),
+                    error_type="webhook_error"
+                )
 
             return {
                 "success": email_sent,
                 "webhook_response": webhook_response,
                 "sent_at": sent_at_time if email_sent else None,
                 "scheduled": False,
-                "email_sent_id": email_sent_id,
+                "email_sent_id": None, # No separate ID anymore
                 "message": webhook_result.get("message", "Email sent via webhook" if email_sent else "Email sending failed"),
                 "error": webhook_result.get("error") if not email_sent else None
             }
@@ -167,14 +167,7 @@ class EmailSendingService:
     ) -> Dict[str, Any]:
         """
         Queue an email for later sending when it's business hours in the lead's timezone
-        
-        Args:
-            lead_id: Lead UUID
-            email_type: Type of email
-            company_country: Lead's country for timezone calculation
-        
-        Returns:
-            Dict with queue status
+        Updates scraped_data with scheduled status
         """
         try:
             # Fetch lead
@@ -183,19 +176,6 @@ class EmailSendingService:
                 return {"success": False, "error": "Lead not found"}
 
             lead = lead_result.data[0]
-            test_email = "prachirathi0712@gmail.com"
-            
-            # Generate email content
-            email_content = await self.email_personalization_service.generate_email_for_lead(
-                lead_id=lead_id,
-                email_type=email_type
-            )
-            
-            if not email_content.get("success"):
-                return {"success": False, "error": email_content.get("error", "Failed to generate email")}
-            
-            subject = email_content.get("subject")
-            body = email_content.get("body")
             
             # Calculate next business hours time (next weekday 9 AM in lead's timezone)
             timezone = self.timezone_service.get_timezone_for_country(company_country)
@@ -222,26 +202,21 @@ class EmailSendingService:
             if scheduled_time.tzinfo is None:
                 scheduled_time = tz.localize(scheduled_time)
             
-            # Insert into email_queue
-            queue_data = {
-                "lead_id": lead_id,
-                "email_to": test_email,
-                "email_subject": subject,
-                "email_body": body,
-                "email_type": email_type,
+            # Update scraped_data with scheduled info
+            update_data = {
+                "mail_status": "scheduled",
                 "scheduled_time": scheduled_time.isoformat(),
-                "timezone": timezone,
-                "status": "pending",
-                "priority": 0
+                "email_timezone": timezone,
+                "email_priority": 0
             }
             
-            queue_result = self.db.table("email_queue").insert(queue_data).execute()
+            self.db.table("scraped_data").update(update_data).eq("id", lead_id).execute()
             
             logger.info(f"✅ Email queued for lead {lead_id} - Scheduled for {scheduled_time} ({timezone})")
             
             return {
                 "success": True,
-                "queue_id": queue_result.data[0]["id"] if queue_result.data else None,
+                "queue_id": lead_id, # Using lead_id as queue_id since it's 1:1 now
                 "scheduled_time": scheduled_time.isoformat(),
                 "timezone": timezone,
                 "message": f"Email queued for {scheduled_time.strftime('%Y-%m-%d %H:%M')} ({timezone})"
@@ -253,25 +228,23 @@ class EmailSendingService:
     
     async def process_email_queue(self) -> Dict[str, Any]:
         """
-        Process pending emails in the queue that are ready to send
+        Process pending emails in the queue (scraped_data with mail_status='scheduled')
         Checks if it's business hours in each lead's timezone and sends if ready
-        
-        Returns:
-            Dict with processing results
         """
         try:
             logger.info("🔄 Processing email queue...")
             
-            # Get all pending emails from queue
+            # Get all scheduled emails
+            # Using scraped_data directly
             queue_result = (
-                self.db.table("email_queue")
+                self.db.table("scraped_data")
                 .select("*")
-                .eq("status", "pending")
+                .eq("mail_status", "scheduled")
                 .execute()
             )
             
             if not queue_result.data:
-                logger.info("📭 No pending emails in queue")
+                logger.info("📭 No scheduled emails found")
                 return {
                     "success": True,
                     "processed": 0,
@@ -281,27 +254,31 @@ class EmailSendingService:
                 }
             
             pending_emails = queue_result.data
-            logger.info(f"📬 Found {len(pending_emails)} pending emails in queue")
+            logger.info(f"📬 Found {len(pending_emails)} scheduled emails")
             
             processed = 0
             sent = 0
             skipped = 0
             failed = 0
             
-            for queue_item in pending_emails:
+            for lead in pending_emails:
                 try:
-                    queue_id = queue_item["id"]
-                    lead_id = queue_item["lead_id"]
-                    scheduled_time_str = queue_item["scheduled_time"]
-                    timezone = queue_item.get("timezone", "UTC")
+                    lead_id = lead["id"]
+                    scheduled_time_str = lead.get("scheduled_time")
+                    timezone = lead.get("email_timezone", "UTC")
                     
+                    if not scheduled_time_str:
+                        logger.warning(f"⚠️ Lead {lead_id} has scheduled status but no time. Skipping.")
+                        skipped += 1
+                        continue
+
                     # Parse scheduled time
                     scheduled_time = datetime.fromisoformat(scheduled_time_str.replace('Z', '+00:00'))
                     now_utc = datetime.utcnow().replace(tzinfo=pytz.UTC)
                     
                     # Check if scheduled time has passed
                     if scheduled_time.replace(tzinfo=pytz.UTC) > now_utc:
-                        logger.info(f"⏰ Email {queue_id} not ready yet (scheduled: {scheduled_time})")
+                        logger.info(f"⏰ Email for {lead_id} not ready yet (scheduled: {scheduled_time})")
                         skipped += 1
                         continue
                     
@@ -316,85 +293,102 @@ class EmailSendingService:
                     
                     if not is_business_hours:
                         reason = "weekend" if not is_weekday else f"outside hours ({current_hour}:00)"
-                        logger.info(f"⏸️ Email {queue_id} - Not in business hours: {reason} ({timezone})")
+                        logger.info(f"⏸️ Email for {lead_id} - Not in business hours: {reason} ({timezone})")
                         skipped += 1
                         continue
                     
                     # It's business hours - send the email
-                    logger.info(f"📧 Sending queued email {queue_id} for lead {lead_id}")
+                    logger.info(f"📧 Sending scheduled email for lead {lead_id}")
                     
-                    # Update queue status to "sending"
-                    self.db.table("email_queue").update({"status": "sending"}).eq("id", queue_id).execute()
+                    # Update status to "sending"
+                    self.db.table("scraped_data").update({"mail_status": "sending"}).eq("id", lead_id).execute()
                     
-                    # Rate limiting: Wait 1.5 seconds before sending to avoid Gmail API rate limits
+                    # Rate limiting: Wait 1.5 seconds before sending
                     await asyncio.sleep(1.5)
                     
+                    # Generate email content (if not already stored - assuming dynamic generation for now)
+                    # For scheduled emails, we might need to regenerate or store content. 
+                    # Assuming we regenerate for freshness or use stored if available.
+                    # For simplicity, let's regenerate or use what's available.
+                    # The original code passed subject/body from queue. 
+                    # Here we need to generate it.
+                    
+                    email_content = await self.email_personalization_service.generate_email_for_lead(
+                        lead_id=lead_id,
+                        email_type="initial" # Defaulting to initial for now
+                    )
+                    
+                    if not email_content.get("success"):
+                        raise Exception(f"Failed to generate email content: {email_content.get('error')}")
+
                     # Send email via webhook
+                    # TEST EMAIL OVERRIDE
+                    test_email = "prachirathi0712@gmail.com"
+                    
                     webhook_result = await self.webhook_service.send_email_via_webhook(
-                        email_to=queue_item["email_to"],
-                        subject=queue_item["email_subject"],
-                        body=queue_item["email_body"],
+                        email_to=test_email, # Using test email
+                        subject=email_content.get("subject"),
+                        body=email_content.get("body"),
                         lead_id=str(lead_id),
-                        email_type=queue_item["email_type"]
+                        email_type="initial"
                     )
                     
                     email_sent = webhook_result.get("success", False) if webhook_result else False
                     webhook_response = webhook_result.get("webhook_response") or {} if webhook_result else {}
                     
                     if email_sent:
-                        # Update queue status to "sent"
                         sent_at = datetime.utcnow().isoformat()
-                        self.db.table("email_queue").update({
-                            "status": "sent",
-                            "sent_at": sent_at
-                        }).eq("id", queue_id).execute()
                         
-                        # Create email record in emails_sent table with status "SENT"
-                        email_insert_data = {
-                            "lead_id": lead_id,
-                            "email_to": queue_item["email_to"],
-                            "email_subject": queue_item["email_subject"],
-                            "email_body": queue_item["email_body"],
-                            "email_type": queue_item["email_type"],
+                        update_data = {
+                            "mail_status": "email_sent",
                             "sent_at": sent_at,
-                            "status": "SENT"
+                            "is_personalized": email_content.get("is_personalized", False),
+                            "company_website_used": email_content.get("company_website_used", False)
                         }
-                        # Add Gmail tracking IDs if available
-                        if webhook_response and isinstance(webhook_response, dict):
-                            if webhook_response.get("message_id"):
-                                email_insert_data["gmail_message_id"] = webhook_response.get("message_id")
-                            if webhook_response.get("thread_id"):
-                                email_insert_data["gmail_thread_id"] = webhook_response.get("thread_id")
                         
-                        self.db.table("emails_sent").insert(email_insert_data).execute()
+                        if webhook_response.get("message_id"):
+                            update_data["gmail_message_id"] = webhook_response.get("message_id")
+                        if webhook_response.get("thread_id"):
+                            update_data["gmail_thread_id"] = webhook_response.get("thread_id")
+                            
+                        self.db.table("scraped_data").update(update_data).eq("id", lead_id).execute()
                         
-                        # Update lead status
-                        self.db.table("scraped_data").update({"status": "email_sent"}).eq("id", lead_id).execute()
-                        
-                        logger.info(f"✅ Queued email {queue_id} sent successfully - Status: SENT")
+                        logger.info(f"✅ Scheduled email for {lead_id} sent successfully - Status: SENT")
                         sent += 1
                     else:
-                        # Update queue status to "failed"
+                        # Failed to send
                         error_msg = webhook_result.get("error", "Unknown error") if webhook_result else "Webhook returned None"
-                        self.db.table("email_queue").update({
-                            "status": "failed",
-                            "error_message": error_msg
-                        }).eq("id", queue_id).execute()
                         
-                        logger.warning(f"❌ Failed to send queued email {queue_id}: {error_msg}")
+                        # Update status to failed
+                        self.db.table("scraped_data").update({
+                            "mail_status": "failed",
+                            "error_message": error_msg
+                        }).eq("id", lead_id).execute()
+                        
+                        # Add to DLQ
+                        await self.dlq_service.add_failed_email(
+                            lead_id=lead_id,
+                            email_to=test_email,
+                            subject=email_content.get("subject"),
+                            body=email_content.get("body"),
+                            error=Exception(error_msg),
+                            error_type="webhook_error"
+                        )
+                        
+                        logger.warning(f"❌ Failed to send scheduled email for {lead_id}: {error_msg}")
                         failed += 1
                     
                     processed += 1
                     
                 except Exception as e:
-                    logger.error(f"❌ Error processing queue item {queue_item.get('id')}: {e}", exc_info=True)
+                    logger.error(f"❌ Error processing scheduled lead {lead.get('id')}: {e}", exc_info=True)
                     failed += 1
                     # Mark as failed
                     try:
-                        self.db.table("email_queue").update({
-                            "status": "failed",
+                        self.db.table("scraped_data").update({
+                            "mail_status": "failed",
                             "error_message": str(e)
-                        }).eq("id", queue_item.get("id")).execute()
+                        }).eq("id", lead.get("id")).execute()
                     except:
                         pass
             
@@ -413,8 +407,6 @@ class EmailSendingService:
             logger.error("=" * 80)
             logger.error(f"❌ CRITICAL ERROR processing email queue: {error_msg}", exc_info=True)
             logger.error("=" * 80)
-            import traceback
-            logger.error(traceback.format_exc())
             return {
                 "success": False,
                 "error": error_msg,

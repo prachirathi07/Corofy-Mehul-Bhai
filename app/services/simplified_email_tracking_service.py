@@ -31,34 +31,34 @@ class SimplifiedEmailTrackingService:
         today = date.today()
         
         try:
-            # Check if we already sent today
-            result = self.db.table("daily_email_tracking").select("*").eq("last_send_date", str(today)).execute()
+            # Check if we already sent today by looking at sent_at in scraped_data
+            # We check if any email was sent today
+            # Note: Supabase/PostgREST doesn't support date casting easily in select, 
+            # so we check for sent_at >= today's start
+            today_start = f"{today}T00:00:00"
             
-            if result.data and len(result.data) > 0:
+            result = self.db.table("scraped_data") \
+                .select("id", count="exact") \
+                .gte("sent_at", today_start) \
+                .limit(1) \
+                .execute()
+            
+            sent_today_count = result.count if result.count else 0
+            
+            if sent_today_count > 0:
                 # Already sent today
-                record = result.data[0]
                 return {
                     "can_send": False,
-                    "reason": f"Emails already sent today ({record.get('leads_processed', 0)} leads processed, {record.get('emails_sent', 0)} emails sent). Try again tomorrow.",
+                    "reason": f"Emails already sent today ({sent_today_count} emails sent). Try again tomorrow.",
                     "last_send_date": today,
-                    "next_batch_offset": record.get("batch_offset", 0)
+                    "next_batch_offset": 0 # Not used anymore
                 }
             else:
-                # Can send today
-                # Get the last send record to determine next batch offset
-                last_result = self.db.table("daily_email_tracking").select("*").order("last_send_date", desc=True).limit(1).execute()
-                
-                if last_result.data and len(last_result.data) > 0:
-                    last_record = last_result.data[0]
-                    next_offset = last_record.get("batch_offset", 0) + 1
-                else:
-                    next_offset = 0  # First time ever
-                
                 return {
                     "can_send": True,
                     "reason": "Ready to send",
                     "last_send_date": None,
-                    "next_batch_offset": next_offset
+                    "next_batch_offset": 0
                 }
                 
         except Exception as e:
@@ -73,18 +73,22 @@ class SimplifiedEmailTrackingService:
     def get_next_batch_leads(self) -> list:
         """
         Get the next batch of unprocessed leads.
-        Returns leads that haven't been processed yet.
-        Locks them immediately by setting status='processing'.
+        Returns leads that:
+        - Are verified (is_verified = true)
+        - Haven't been sent yet (mail_status not in ['sent', 'email_sent'])
+        - Have valid email addresses
+        - Haven't been processed yet (email_processed = false/null)
         """
         try:
-            # Get unprocessed leads with valid emails
-            # Filter out already processing leads
+            # Get unprocessed, verified leads with valid emails that haven't been sent
             result = self.db.table("scraped_data") \
                 .select("*") \
+                .eq("is_verified", True) \
                 .is_("email_processed", "null") \
                 .neq("status", "processing") \
                 .not_.is_("founder_email", "null") \
                 .neq("founder_email", "") \
+                .not_.in_("mail_status", ["email_sent", "reply_received", "2nd followup sent"]) \
                 .limit(self.batch_size) \
                 .execute()
             
@@ -92,10 +96,12 @@ class SimplifiedEmailTrackingService:
             if not result.data or len(result.data) == 0:
                 result = self.db.table("scraped_data") \
                     .select("*") \
+                    .eq("is_verified", True) \
                     .eq("email_processed", False) \
                     .neq("status", "processing") \
                     .not_.is_("founder_email", "null") \
                     .neq("founder_email", "") \
+                    .not_.in_("mail_status", ["email_sent", "reply_received", "2nd followup sent"]) \
                     .limit(self.batch_size) \
                     .execute()
             
@@ -105,7 +111,9 @@ class SimplifiedEmailTrackingService:
                 # LOCK LEADS IMMEDIATELY
                 lead_ids = [l["id"] for l in leads]
                 self.db.table("scraped_data").update({"status": "processing"}).in_("id", lead_ids).execute()
-                logger.info(f"🔒 Locked {len(leads)} leads for processing")
+                logger.info(f"🔒 Locked {len(leads)} verified, unsent leads for processing")
+            else:
+                logger.info("📭 No verified, unsent leads found")
                 
             return leads
             
@@ -130,27 +138,11 @@ class SimplifiedEmailTrackingService:
     def record_send_completion(self, batch_offset: int, leads_processed: int, emails_sent: int) -> bool:
         """
         Record that emails were sent today.
-        This prevents sending again until tomorrow.
+        No longer uses daily_email_tracking table.
+        Just logs the completion as scraped_data is updated individually.
         """
-        today = date.today()
-        
-        try:
-            record = {
-                "last_send_date": str(today),
-                "batch_offset": batch_offset,
-                "leads_processed": leads_processed,
-                "emails_sent": emails_sent
-            }
-            
-            # Insert today's record
-            self.db.table("daily_email_tracking").insert(record).execute()
-            
-            logger.info(f"📊 Recorded send completion: Batch {batch_offset}, {leads_processed} leads processed, {emails_sent} emails sent")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error recording send completion: {e}")
-            return False
+        logger.info(f"📊 Batch completion: {leads_processed} leads processed, {emails_sent} emails sent")
+        return True
     
     def get_stats(self) -> Dict:
         """Get overall statistics"""
@@ -166,15 +158,24 @@ class SimplifiedEmailTrackingService:
             # Remaining
             remaining = total_leads - total_processed
             
-            # Last send info
-            last_send = self.db.table("daily_email_tracking").select("*").order("last_send_date", desc=True).limit(1).execute()
+            # Last send info - get max sent_at
+            last_send_result = self.db.table("scraped_data") \
+                .select("sent_at") \
+                .not_.is_("sent_at", "null") \
+                .order("sent_at", desc=True) \
+                .limit(1) \
+                .execute()
+            
+            last_send_date = None
+            if last_send_result.data:
+                last_send_date = last_send_result.data[0].get("sent_at")
             
             return {
                 "total_leads": total_leads,
                 "total_processed": total_processed,
                 "remaining_leads": remaining,
-                "last_send_date": last_send.data[0].get("last_send_date") if last_send.data else None,
-                "last_batch_offset": last_send.data[0].get("batch_offset") if last_send.data else None
+                "last_send_date": last_send_date,
+                "last_batch_offset": 0
             }
             
         except Exception as e:

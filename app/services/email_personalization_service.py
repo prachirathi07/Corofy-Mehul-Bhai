@@ -103,13 +103,15 @@ class EmailPersonalizationService:
             
             # Check if email already generated (unless force_regenerate OR we have website content that wasn't used)
             should_regenerate = force_regenerate
-            if not force_regenerate:
-                existing_email = self.db.table("emails_sent").select("*").eq("lead_id", lead_id).eq("email_type", email_type).execute()
-                if existing_email.data and len(existing_email.data) > 0:
-                    existing_record = existing_email.data[0]
-                    existing_website_used = existing_record.get("company_website_used", False)
-                    existing_personalized = existing_record.get("is_personalized", False)
-                    
+            
+            # Only check cache for 'initial' email type as we store it in email_content
+            if not force_regenerate and email_type == "initial":
+                existing_content = lead.get("email_content")
+                existing_subject = lead.get("email_subject")
+                existing_personalized = lead.get("is_personalized", False)
+                existing_website_used = lead.get("company_website_used", False)
+                
+                if existing_content and existing_subject:
                     # If we have website content but the existing email wasn't personalized with it, regenerate
                     if company_website_content and len(company_website_content.strip()) > 0:
                         if not existing_website_used or not existing_personalized:
@@ -119,8 +121,8 @@ class EmailPersonalizationService:
                             logger.info(f"✅ PERSONALIZATION: Using existing personalized email for lead {lead_id}")
                             return {
                                 "success": True,
-                                "subject": existing_record.get("email_subject"),
-                                "body": existing_record.get("email_body"),
+                                "subject": existing_subject,
+                                "body": existing_content,
                                 "from_cache": True,
                                 "is_personalized": existing_personalized,
                                 "company_website_used": existing_website_used
@@ -130,8 +132,8 @@ class EmailPersonalizationService:
                         logger.info(f"📧 PERSONALIZATION: Using existing email for lead {lead_id} (no website content available)")
                         return {
                             "success": True,
-                            "subject": existing_record.get("email_subject"),
-                            "body": existing_record.get("email_body"),
+                            "subject": existing_subject,
+                            "body": existing_content,
                             "from_cache": True,
                             "is_personalized": existing_personalized,
                             "company_website_used": existing_website_used
@@ -156,6 +158,8 @@ class EmailPersonalizationService:
             )
             
             logger.info(f"🤖 PERSONALIZATION: OpenAI result - Success: {email_result.get('success')}, Industry: {email_result.get('industry')}")
+            
+            final_result = {}
             
             if email_result.get("success"):
                 # Select Template based on Industry
@@ -199,7 +203,7 @@ class EmailPersonalizationService:
                 final_html_body = template.replace("{{LeadName}}", greeting_name)
                 final_html_body = final_html_body.replace("{{BodyContent}}", email_result.get("body"))
                 
-                return {
+                final_result = {
                     "success": True,
                     "subject": email_result.get("subject"),
                     "body": final_html_body, # Return full HTML
@@ -239,7 +243,7 @@ class EmailPersonalizationService:
                 if "{{BodyContent}}" in final_html_body:
                     final_html_body = final_html_body.replace("{{BodyContent}}", default_pitch)
                 
-                return {
+                final_result = {
                     "success": True,
                     "subject": default_subject,
                     "body": final_html_body,
@@ -250,6 +254,22 @@ class EmailPersonalizationService:
                     "email_type": email_type,
                     "used_default_template": True
                 }
+            
+            # Save generated email to scraped_data if it's the initial email
+            if final_result.get("success") and email_type == "initial":
+                try:
+                    update_data = {
+                        "email_content": final_result.get("body"),
+                        "email_subject": final_result.get("subject"),
+                        "is_personalized": final_result.get("is_personalized", False),
+                        "company_website_used": final_result.get("company_website_used", False)
+                    }
+                    self.db.table("scraped_data").update(update_data).eq("id", lead_id).execute()
+                    logger.info(f"💾 Saved generated email to scraped_data for lead {lead_id}")
+                except Exception as e:
+                    logger.error(f"Failed to save generated email to DB: {e}")
+            
+            return final_result
         
         except Exception as e:
             logger.error(f"Error generating email for lead {lead_id}: {e}", exc_info=True)
