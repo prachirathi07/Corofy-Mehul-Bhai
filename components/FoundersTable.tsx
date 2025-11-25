@@ -53,23 +53,47 @@ export default function FoundersTable() {
   const [deleteMessage, setDeleteMessage] = useState('');
   const [showLimitToast, setShowLimitToast] = useState(false);
   const [showLimitPopup, setShowLimitPopup] = useState(false);
-
-  // Email limit and timer states
-  const EMAIL_LIMIT = 400;
+  const [lastSentCount, setLastSentCount] = useState<number>(0); // Track count of emails just sent
+  const [sentEmailIds, setSentEmailIds] = useState<Set<string>>(new Set()); // Track which emails have been sent (and should be disabled)
+  
+  // Email timer states
   const [emailSendTimestamp, setEmailSendTimestamp] = useState<number | null>(null);
   const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
   const [canSendEmails, setCanSendEmails] = useState(true);
-  const [totalEmailsSent, setTotalEmailsSent] = useState<number>(0); // Track cumulative emails sent
+  const [isResettingTimer, setIsResettingTimer] = useState(false);
 
   const refreshData = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const { data: supabaseData, error: supabaseError } = await supabase
-        .from('scraped_data')
-        .select('*');
+      // Fetch all data from the database in chunks
+      let allData: any[] = [];
+      let from = 0;
+      const step = 1000;
+      let fetchMore = true;
 
-      if (supabaseError) throw supabaseError;
+      while (fetchMore) {
+        const { data: chunk, error: chunkError } = await supabase
+          .from('scraped_data')
+          .select('*')
+          .range(from, from + step - 1);
+
+        if (chunkError) throw chunkError;
+
+        if (chunk && chunk.length > 0) {
+          allData = [...allData, ...chunk];
+          from += step;
+          // If we got fewer rows than requested, we've reached the end
+          if (chunk.length < step) {
+            fetchMore = false;
+          }
+        } else {
+          fetchMore = false;
+        }
+      }
+
+      const supabaseData = allData;
+      const supabaseError = null; // Error handling is done inside the loop
 
       // Map Supabase data to Founder interface
       const mappedFounders: Founder[] = (supabaseData || []).map((item: any) => ({
@@ -96,7 +120,41 @@ export default function FoundersTable() {
         ...item // Include all other properties
       }));
 
-      setFounders(mappedFounders);
+      const verifiedCount = mappedFounders.filter(f => f['Verification'] === true).length;
+      console.log(`✅ Fetched ${mappedFounders.length} founders, ${verifiedCount} are verified in database.`);
+
+      // Track which emails are already verified (sent) in database
+      // If verified in DB -> Add to sentEmailIds -> Renders as Gray/Disabled Checkbox
+      const alreadySentIds = new Set(mappedFounders.filter(f => f['Verification'] === true).map(f => f.id));
+      setSentEmailIds(alreadySentIds);
+      console.log(`🔒 ${alreadySentIds.size} emails are already verified and will be disabled`);
+
+      // Sort by created_at descending (newest first)
+      const sortedFounders = mappedFounders.sort((a, b) => {
+        const dateA = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const dateB = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return dateB - dateA; // Descending order (newest first)
+      });
+
+      // Auto-select first 400 unverified emails (UI Only)
+      let count = 0;
+      const foundersWithAutoSelect = sortedFounders.map(f => {
+        // If already verified (sent), keep as is
+        if (f['Verification'] === true) return f;
+
+        // If unverified and we haven't selected 400 yet, select it
+        if (count < 400) {
+          count++;
+          return { ...f, 'Verification': true }; // Check in UI
+        }
+
+        return f;
+      });
+
+      console.log(`🎯 Auto-selected ${count} unverified emails for sending`);
+
+      // Just load the data as-is from the database
+      setFounders(foundersWithAutoSelect);
       setLastRefreshTime(new Date());
       setCurrentPage(1);
 
@@ -118,140 +176,192 @@ export default function FoundersTable() {
     refreshData();
   }, [refreshData]);
 
-  // Auto-select next 400 unsent emails after timer expires
-  const autoSelectNextBatch = useCallback(() => {
-    const unsentFounders = founders.filter(f =>
-      f['Mail Status'] !== 'SENT' &&
-      (f['Verification'] === false || f['Verification'] === null)
-    );
-
-    // Select up to 400 unsent founders
-    const toSelect = unsentFounders.slice(0, EMAIL_LIMIT);
-
-    // Update verification to true for these founders
-    setFounders(prevFounders =>
-      prevFounders.map(founder => {
-        const shouldSelect = toSelect.some(f => f.id === founder.id);
-        return shouldSelect
-          ? { ...founder, 'Verification': true }
-          : founder;
-      })
-    );
-  }, [founders, EMAIL_LIMIT]);
-
-  // Load email send timestamp from database and check timer status
+  // Load timer immediately on mount (before user is loaded from localStorage)
   useEffect(() => {
-    const loadEmailTimer = async () => {
-      const userEmail = user || 'corofy.marketing@gmail.com';
+    const loadTimerOnMount = async () => {
+      // Get user email from localStorage first (available immediately)
+      const savedUser = localStorage.getItem('auth_user');
+      const userEmail = savedUser || 'corofy.marketing@gmail.com';
+      
       try {
-        // Try to load from database first
-        const { data, error } = await supabase
-          .from('email_timer')
-          .select('timestamp')
-          .eq('user_email', userEmail)
-          .single();
-
-        let timestamp = null;
-
-        if (error && error.code !== 'PGRST116') { // PGRST116 is "no rows returned"
-          // If table doesn't exist or other error, try localStorage
-          console.warn('Database timer load failed, checking localStorage:', error.message);
-          const localTimestamp = localStorage.getItem(`email_timer_${userEmail}`);
-          if (localTimestamp) {
-            timestamp = parseInt(localTimestamp, 10);
-          }
-        } else if (data && data.timestamp && data.timestamp > 0) {
-          timestamp = data.timestamp;
-        } else {
-          // No database timer, check localStorage
-          const localTimestamp = localStorage.getItem(`email_timer_${userEmail}`);
-          if (localTimestamp) {
-            timestamp = parseInt(localTimestamp, 10);
-          }
+        console.log('🔄 [MOUNT] Loading email timer from database for:', userEmail);
+        const response = await fetch(`/api/email-timer?userEmail=${encodeURIComponent(userEmail)}`);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
         }
-
-        if (timestamp && timestamp > 0) {
-          setEmailSendTimestamp(timestamp);
-
+        
+        const data = await response.json();
+        console.log('📦 [MOUNT] Timer data received:', data);
+        
+        if (data.success && data.timestamp && data.timestamp > 0) {
+          const timestamp = Number(data.timestamp);
+          console.log('⏰ [MOUNT] Found active timer, timestamp:', timestamp);
+          
           const now = Date.now();
           const elapsed = now - timestamp;
           const twentyFourHours = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
-
+          
+          console.log('⏱️ [MOUNT] Elapsed time:', elapsed, 'ms (', Math.floor(elapsed / 1000 / 60), 'minutes)');
+          
           if (elapsed < twentyFourHours) {
             const remaining = twentyFourHours - elapsed;
+            console.log('⏳ [MOUNT] Timer still active, remaining:', Math.floor(remaining / 1000 / 60), 'minutes');
+            setEmailSendTimestamp(timestamp);
             setTimeRemaining(remaining);
             setCanSendEmails(false);
           } else {
-            // Timer expired, clear from both database and localStorage
-            try {
-              await supabase
-                .from('email_timer')
-                .update({ timestamp: 0 })
-                .eq('user_email', userEmail);
-            } catch (e) {
-              console.warn('Could not clear database timer:', e);
-            }
-            localStorage.removeItem(`email_timer_${userEmail}`);
-
+            // Timer expired, clear timestamp and allow sending
+            console.log('✅ [MOUNT] Timer expired, clearing...');
+            await fetch('/api/email-timer', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userEmail, timestamp: 0 })
+            });
             setEmailSendTimestamp(null);
             setTimeRemaining(null);
             setCanSendEmails(true);
           }
         } else {
           // No timer active
+          console.log('✅ [MOUNT] No active timer found');
           setEmailSendTimestamp(null);
           setTimeRemaining(null);
           setCanSendEmails(true);
         }
       } catch (error) {
-        console.error('Error loading email timer:', error);
+        console.error('❌ [MOUNT] Error loading email timer:', error);
         // On error, allow sending (fail open)
+        setEmailSendTimestamp(null);
+        setTimeRemaining(null);
         setCanSendEmails(true);
       }
     };
 
-    if (user) {
+    // Load timer immediately on mount
+    loadTimerOnMount();
+  }, []); // Empty dependency array - runs only on mount
+
+
+  // Load email send timestamp from database and check timer status
+  useEffect(() => {
+    const loadEmailTimer = async () => {
+      // Get user email - try from auth context first, then localStorage, then fallback
+      let userEmail = user;
+      if (!userEmail) {
+        const savedUser = localStorage.getItem('auth_user');
+        userEmail = savedUser || 'corofy.marketing@gmail.com';
+      }
+      
+      try {
+        console.log('🔄 Loading email timer from database for:', userEmail);
+        const response = await fetch(`/api/email-timer?userEmail=${encodeURIComponent(userEmail)}`);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        console.log('📦 Timer data received:', data);
+        
+        if (data.success && data.timestamp && data.timestamp > 0) {
+          const timestamp = Number(data.timestamp);
+          console.log('⏰ Found active timer, timestamp:', timestamp, 'Current time:', Date.now());
+          
+          const now = Date.now();
+          const elapsed = now - timestamp;
+          const twentyFourHours = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+          
+          console.log('⏱️ Elapsed time:', elapsed, 'ms (', Math.floor(elapsed / 1000 / 60), 'minutes)');
+          
+          if (elapsed < twentyFourHours) {
+            const remaining = twentyFourHours - elapsed;
+            console.log('⏳ Timer still active, remaining:', Math.floor(remaining / 1000 / 60), 'minutes');
+            setEmailSendTimestamp(timestamp);
+            setTimeRemaining(remaining);
+            setCanSendEmails(false);
+          } else {
+            // Timer expired, clear timestamp and allow sending
+            console.log('✅ Timer expired, clearing...');
+            await fetch('/api/email-timer', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userEmail, timestamp: 0 })
+            });
+            setEmailSendTimestamp(null);
+            setTimeRemaining(null);
+            setCanSendEmails(true);
+          }
+        } else {
+          // No timer active
+          console.log('✅ No active timer found');
+          setEmailSendTimestamp(null);
+          setTimeRemaining(null);
+          setCanSendEmails(true);
+        }
+      } catch (error) {
+        console.error('❌ Error loading email timer:', error);
+        // On error, allow sending (fail open)
+        setEmailSendTimestamp(null);
+        setTimeRemaining(null);
+        setCanSendEmails(true);
+      }
+    };
+
+    // Load timer on mount and when user changes
+    // Use a small delay to ensure localStorage is available
+    const timer = setTimeout(() => {
       loadEmailTimer();
-    }
+    }, 100);
+
+    return () => clearTimeout(timer);
   }, [user]);
 
   // Timer countdown effect
   useEffect(() => {
-    if (!emailSendTimestamp || canSendEmails) return;
+    if (!emailSendTimestamp || canSendEmails) {
+      // If timer is not active, make sure state is clean
+      if (!emailSendTimestamp) {
+        setTimeRemaining(null);
+      }
+      return;
+    }
+
+    console.log('⏰ Starting countdown timer, timestamp:', emailSendTimestamp);
 
     const interval = setInterval(async () => {
       const now = Date.now();
       const elapsed = now - emailSendTimestamp;
       const twentyFourHours = 24 * 60 * 60 * 1000;
-
+      
       if (elapsed >= twentyFourHours) {
-        // Timer expired - clear from both database and localStorage
+        // Timer expired - clear from database
+        console.log('✅ Timer expired, clearing from database');
         const userEmail = user || 'corofy.marketing@gmail.com';
         try {
-          await supabase
-            .from('email_timer')
-            .update({ timestamp: 0 })
-            .eq('user_email', userEmail);
+          await fetch('/api/email-timer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userEmail, timestamp: 0 })
+          });
         } catch (error) {
-          console.warn('Could not clear database timer:', error);
+          console.error('Error clearing email timer:', error);
         }
-        localStorage.removeItem(`email_timer_${userEmail}`);
-
         setEmailSendTimestamp(null);
         setTimeRemaining(null);
         setCanSendEmails(true);
         clearInterval(interval);
-
-        // Auto-select next 400 unsent emails
-        autoSelectNextBatch();
       } else {
         const remaining = twentyFourHours - elapsed;
         setTimeRemaining(remaining);
       }
     }, 1000); // Update every second
 
-    return () => clearInterval(interval);
-  }, [emailSendTimestamp, canSendEmails, autoSelectNextBatch, user]);
+    return () => {
+      console.log('🧹 Cleaning up countdown interval');
+      clearInterval(interval);
+    };
+  }, [emailSendTimestamp, canSendEmails, user]);
 
   // Fetch founders when industry changes or component mounts
   useEffect(() => {
@@ -263,6 +373,31 @@ export default function FoundersTable() {
     const handleVisibilityChange = () => {
       if (!document.hidden) {
         refreshData();
+        // Also reload timer when page becomes visible
+        const userEmail = user || 'corofy.marketing@gmail.com';
+        fetch(`/api/email-timer?userEmail=${encodeURIComponent(userEmail)}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.success && data.timestamp && data.timestamp > 0) {
+              const timestamp = Number(data.timestamp);
+              const now = Date.now();
+              const elapsed = now - timestamp;
+              const twentyFourHours = 24 * 60 * 60 * 1000;
+              
+              if (elapsed < twentyFourHours) {
+                const remaining = twentyFourHours - elapsed;
+                setEmailSendTimestamp(timestamp);
+                setTimeRemaining(remaining);
+                setCanSendEmails(false);
+              } else {
+                // Timer expired
+                setEmailSendTimestamp(null);
+                setTimeRemaining(null);
+                setCanSendEmails(true);
+              }
+            }
+          })
+          .catch(err => console.error('Error refreshing timer:', err));
       }
     };
 
@@ -270,7 +405,7 @@ export default function FoundersTable() {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [selectedIndustry, refreshData]);
+  }, [selectedIndustry, refreshData, user]);
 
   // const formatDate = (dateString: string) => {
   //   return new Date(dateString).toLocaleDateString('en-US', {
@@ -326,72 +461,161 @@ export default function FoundersTable() {
     return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
   };
 
+  // Reset timer function
+  const handleResetTimer = async () => {
+    // Confirm with user
+    const confirmed = window.confirm('Are you sure you want to reset the timer? This will allow you to send emails immediately.');
+    
+    if (!confirmed) {
+      return;
+    }
+
+    setIsResettingTimer(true);
+    try {
+      // Get user email - try from auth context first, then localStorage, then fallback
+      let userEmail = user;
+      if (!userEmail) {
+        const savedUser = localStorage.getItem('auth_user');
+        userEmail = savedUser || 'corofy.marketing@gmail.com';
+      }
+
+      console.log('🔄 Resetting timer for:', userEmail);
+      
+      const response = await fetch('/api/email-timer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userEmail, timestamp: 0 })
+      });
+
+      const data = await response.json();
+      console.log('📦 Reset timer response:', data);
+
+      if (data.success) {
+        // Clear timer state
+        setEmailSendTimestamp(null);
+        setTimeRemaining(null);
+        setCanSendEmails(true);
+        console.log('✅ Timer reset successfully');
+      } else {
+        console.error('❌ Failed to reset timer:', data.error);
+        alert(`Failed to reset timer: ${data.error || 'Unknown error'}`);
+      }
+    } catch (error) {
+      console.error('❌ Error resetting timer:', error);
+      alert('Error resetting timer. Please try again.');
+    } finally {
+      setIsResettingTimer(false);
+    }
+  };
 
 
-  // Auto-select first 400 unverified emails when data loads
-  useEffect(() => {
-    if (!isLoading && founders.length > 0) {
-      // Get unverified founders (those without verification in DATABASE and mail not sent)
-      // This filters for emails where is_verified is false/null in the database
-      const unverifiedFounders = founders.filter(f =>
-        !f['Verification'] && f['Mail Status'] !== 'SENT'
-      );
 
-      if (unverifiedFounders.length > 0) {
-        // Always select up to 400 from the top
-        const toSelect = unverifiedFounders.slice(0, EMAIL_LIMIT);
-        const idsToSelect = new Set(toSelect.map(f => f.id));
+  // Helper function to chunk array updates (Supabase has limits on batch operations)
+  const chunkArray = <T,>(array: T[], chunkSize: number): T[][] => {
+    const chunks: T[][] = [];
+    for (let i = 0; i < array.length; i += chunkSize) {
+      chunks.push(array.slice(i, i + chunkSize));
+    }
+    return chunks;
+  };
 
-        console.log(`🎯 Auto-selecting exactly ${toSelect.length} unverified emails from top`);
+  // Helper function to update database in chunks with retry logic
+  const updateDatabaseInChunks = async (
+    ids: string[],
+    updateValue: boolean,
+    operationName: string
+  ): Promise<{ success: boolean; error?: any }> => {
+    if (ids.length === 0) {
+      return { success: true };
+    }
 
-        // Update verification status: 
-        // - Set to true ONLY for the first 400 unverified emails
-        // - Set to false for all other unverified emails (reset any previous UI selections)
-        // - Keep true for emails that are already verified in database
-        setFounders(prevFounders =>
-          prevFounders.map(founder => {
-            // If already verified in database, keep it
-            if (founder['Verification'] === true && founder['Mail Status'] === 'SENT') {
-              return founder;
-            }
-            // If in the top 400 unverified, select it
-            if (idsToSelect.has(founder.id)) {
-              return { ...founder, 'Verification': true };
-            }
-            // Otherwise, unselect it (reset UI state)
-            return { ...founder, 'Verification': false };
-          })
-        );
+    const CHUNK_SIZE = 100; // Supabase typically handles 100-1000 records per batch
+    const chunks = chunkArray(ids, CHUNK_SIZE);
+    const errors: any[] = [];
+
+    console.log(`💾 ${operationName}: Processing ${ids.length} records in ${chunks.length} chunks...`);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      let retries = 3;
+      let success = false;
+
+      while (retries > 0 && !success) {
+        try {
+          const { error } = await supabase
+            .from('scraped_data')
+            .update({ is_verified: updateValue })
+            .in('id', chunk);
+
+          if (error) {
+            throw error;
+          }
+
+          success = true;
+          console.log(`✅ ${operationName}: Chunk ${i + 1}/${chunks.length} completed (${chunk.length} records)`);
+        } catch (error: any) {
+          retries--;
+          if (retries === 0) {
+            console.error(`❌ ${operationName}: Chunk ${i + 1}/${chunks.length} failed after 3 retries:`, error);
+            errors.push({ chunk: i + 1, error });
+          } else {
+            console.warn(`⚠️ ${operationName}: Chunk ${i + 1}/${chunks.length} failed, retrying... (${retries} retries left)`);
+            // Exponential backoff
+            await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)));
+          }
+        }
       }
     }
-  }, [isLoading, lastRefreshTime]); // Trigger on data refresh
+
+    if (errors.length > 0) {
+      return { success: false, error: errors };
+    }
+
+    return { success: true };
+  };
+
+  // No auto-selection - just display checkboxes based on database is_verified value
+  // Users can freely check/uncheck emails (except sent ones)
+
+  // No auto-selection - just display checkboxes based on database is_verified value
+  // Users can freely check/uncheck emails (except sent ones)
 
 
-  const handleVerificationChange = async (founderId: string, currentValue: boolean | null) => {
-    // Don't allow changes if timer is active (emails were sent and waiting for 24 hours)
-    if (!canSendEmails && totalEmailsSent >= EMAIL_LIMIT) {
+  // Selection limit constant
+  const SELECTION_LIMIT = 400;
+
+  // Simple checkbox toggle - UI only, no database update, no limits
+  const handleVerificationChange = (founderId: string, currentValue: boolean | null) => {
+    // Don't allow changes if timer is active
+    if (!canSendEmails) {
+      console.log('❌ Cannot change - timer is active');
       return;
     }
 
-    // Don't allow changes if mail was already sent
-    const founder = founders.find(f => f.id === founderId);
-    if (founder && founder['Mail Status'] === 'SENT') {
+    // Only prevent changes if email was already sent (in sentEmailIds)
+    if (sentEmailIds.has(founderId)) {
+      console.log('❌ Cannot change - email already sent');
       return;
     }
 
-    // Get current verified count
-    const currentVerifiedCount = founders.filter(f => f['Verification'] === true).length;
-    const isChecking = !currentValue; // true if we're checking this box
+    const isChecking = !currentValue;
 
-    // If checking a box, enforce 400 limit
-    if (isChecking && currentVerifiedCount >= EMAIL_LIMIT) {
-      setShowLimitPopup(true);
-      setTimeout(() => setShowLimitPopup(false), 3000);
-      return;
+    // If checking a box, enforce SELECTION_LIMIT (400)
+    if (isChecking) {
+      // Count currently selected (verified) emails that are NOT sent
+      const currentSelectedCount = founders.filter(
+        f => f['Verification'] === true && !sentEmailIds.has(f.id)
+      ).length;
+
+      if (currentSelectedCount >= SELECTION_LIMIT) {
+        console.log(`❌ Cannot select more than ${SELECTION_LIMIT} emails`);
+        setShowLimitPopup(true);
+        setTimeout(() => setShowLimitPopup(false), 3000);
+        return;
+      }
     }
 
-    // Only update the UI state - don't update database yet
-    // Database will be updated when Send Mail button is clicked
+    // Toggle the checkbox in UI state only
     setFounders(prevFounders =>
       prevFounders.map(founder =>
         founder.id === founderId
@@ -399,6 +623,8 @@ export default function FoundersTable() {
           : founder
       )
     );
+
+    console.log(`✅ Checkbox ${isChecking ? 'checked' : 'unchecked'} in UI`);
   };
 
 
@@ -483,7 +709,7 @@ export default function FoundersTable() {
 
       // Delete from Supabase
       const { error: deleteError } = await supabase
-        .from('scraped_data')
+        .from('scraped_data_new')
         .delete()
         .in('id', idsToDelete);
 
@@ -516,17 +742,33 @@ export default function FoundersTable() {
     setShowDeleteConfirmPopup(false);
   };
 
-  // Get verified founders (those with Verification checked)
+  // Get verified founders (those with Verification checked AND not yet sent)
+  // Get all verified unsent emails (no limit)
   const getVerifiedFounders = () => {
-    return founders.filter(f => f['Verification'] === true);
+    return founders.filter(f => {
+      const isVerified = f['Verification'] === true;
+      // Exclude if already sent/verified in DB (in sentEmailIds)
+      const isAlreadySent = sentEmailIds.has(f.id);
+
+      const mailStatus = f['Mail Status'];
+      const isNotSent = !mailStatus || mailStatus === null || mailStatus !== 'SENT';
+
+      // Only return verified emails that haven't been sent yet
+      return isVerified && isNotSent && !isAlreadySent;
+    }).sort((a, b) => (a.id || '').localeCompare(b.id || ''));
   };
 
-  // Handle send to webhook - updates database verification column for both checked and unchecked
+  // Handle send to webhook - marks emails as sent and starts 24-hour timer
   const handleSendToWebhook = async () => {
     setIsSendingEmail(true);
     try {
-      // Get founders that are checked (should be true in database)
-      const verifiedFounders = founders.filter(f => f['Verification'] === true);
+      // Get only unsent verified founders (those ready to send)
+      const verifiedFounders = founders.filter(f => {
+        const isVerified = f['Verification'] === true;
+        const mailStatus = f['Mail Status'];
+        const isNotSent = !mailStatus || mailStatus === null || mailStatus !== 'SENT';
+        return isVerified && isNotSent;
+      });
 
       if (verifiedFounders.length === 0) {
         alert('No founders selected for email');
@@ -534,90 +776,121 @@ export default function FoundersTable() {
         return;
       }
 
-      // Calculate remaining emails available to send
-      const remainingEmails = EMAIL_LIMIT - totalEmailsSent;
+      console.log(`📧 Sending emails to ${verifiedFounders.length} verified founders...`);
 
-      // Check if this batch would exceed the limit
-      if (verifiedFounders.length > remainingEmails) {
-        alert(`You can only send ${remainingEmails} more email${remainingEmails !== 1 ? 's' : ''} (${totalEmailsSent} already sent out of ${EMAIL_LIMIT} limit). Please uncheck ${verifiedFounders.length - remainingEmails} email${verifiedFounders.length - remainingEmails !== 1 ? 's' : ''} to continue.`);
-        setIsSendingEmail(false);
-        return;
+      // Update verification status in database from false to true using chunked updates
+      const founderIds = verifiedFounders.map(f => f.id);
+
+      // Update is_verified from false to true for selected founders using chunked updates
+      const CHUNK_SIZE = 100;
+      const chunks = chunkArray(founderIds, CHUNK_SIZE);
+      const errors: any[] = [];
+
+      console.log(`💾 Updating verification status (false -> true) for ${founderIds.length} emails in ${chunks.length} chunks...`);
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        let retries = 3;
+        let success = false;
+
+        while (retries > 0 && !success) {
+          try {
+            const { error } = await supabase
+              .from('scraped_data')
+              .update({
+                is_verified: true // Update verification status from false to true
+              })
+              .in('id', chunk);
+
+            if (error) {
+              throw error;
+            }
+
+            success = true;
+            console.log(`✅ Updated verification (false -> true) for chunk ${i + 1}/${chunks.length} (${chunk.length} records)`);
+          } catch (error: any) {
+            retries--;
+            if (retries === 0) {
+              console.error(`❌ Chunk ${i + 1}/${chunks.length} failed after 3 retries:`, error);
+              errors.push({ chunk: i + 1, error });
+            } else {
+              console.warn(`⚠️ Chunk ${i + 1}/${chunks.length} failed, retrying... (${retries} retries left)`);
+              await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)));
+            }
+          }
+        }
       }
 
-      // Check if timer is active and we've reached the limit
-      if (!canSendEmails && totalEmailsSent >= EMAIL_LIMIT) {
-        alert(`You have reached the ${EMAIL_LIMIT} email limit. Please wait for the 24-hour timer to expire before sending more emails.`);
-        setIsSendingEmail(false);
-        return;
-      }
+      const failedStatusUpdates = errors;
 
-      // Update database verification to true for checked founders
-      const verifyPromises = verifiedFounders.map(founder =>
-        supabase
-          .from('scraped_data')
-          .update({ is_verified: true })
-          .eq('id', founder.id)
-      );
-
-      // Wait for all database updates to complete
-      const updateResults = await Promise.all(verifyPromises);
-      const failedUpdates = updateResults.filter(r => r.error);
-
-      if (failedUpdates.length > 0) {
-        console.error(`Failed to update ${failedUpdates.length} founder(s) in database`, failedUpdates);
+      if (failedStatusUpdates.length > 0) {
+        console.error(`Failed to update verification for ${failedStatusUpdates.length} founder(s)`, failedStatusUpdates);
         alert('Some updates failed. Please try again.');
         setIsSendingEmail(false);
         return;
       }
 
-      console.log(`✅ Updated ${verifiedFounders.length} verification records to true in database`);
+      console.log(`✅ Updated verification status (false -> true) for ${verifiedFounders.length} emails in database`);
 
-      // Calculate new total after this send
-      const newTotalSent = totalEmailsSent + verifiedFounders.length;
+      // Store count for success message
+      setLastSentCount(verifiedFounders.length);
 
-      // Start 24-hour timer only if we've reached or exceeded the EMAIL_LIMIT (400) emails
-      // This is cumulative across all batches
-      if (newTotalSent >= EMAIL_LIMIT) {
-        const timestamp = Date.now();
-        const userEmail = user || 'corofy.marketing@gmail.com';
+      // Add sent email IDs to the set (to disable checkboxes)
+      setSentEmailIds(prev => {
+        const newSet = new Set(prev);
+        founderIds.forEach(id => newSet.add(id));
+        return newSet;
+      });
+      console.log(`🔒 Disabled ${founderIds.length} checkboxes after sending`);
 
-        // Try to save timer to database, fall back to localStorage if table doesn't exist
-        try {
-          const { error: timerError } = await supabase
-            .from('email_timer')
-            .upsert({
-              user_email: userEmail,
-              timestamp: timestamp,
-              updated_at: new Date().toISOString()
-            }, {
-              onConflict: 'user_email'
-            });
-
-          if (timerError) {
-            console.warn('Database timer save failed, using localStorage:', timerError.message);
-            // Fallback to localStorage
-            localStorage.setItem(`email_timer_${userEmail}`, timestamp.toString());
-          } else {
-            console.log('✅ Timer saved to database');
+      // Update UI immediately to show updated verification status
+      setFounders(prevFounders =>
+        prevFounders.map(founder => {
+          if (founderIds.includes(founder.id)) {
+            return {
+              ...founder,
+              'Verification': true // Only update verification status
+            };
           }
-        } catch (error) {
-          console.warn('Error saving email timer to database, using localStorage:', error);
-          // Fallback to localStorage
-          localStorage.setItem(`email_timer_${userEmail}`, timestamp.toString());
-        }
+          return founder;
+        })
+      );
 
-        setEmailSendTimestamp(timestamp);
-        setTimeRemaining(24 * 60 * 60 * 1000); // 24 hours in milliseconds
-        setCanSendEmails(false);
-        console.log(`⏰ Timer started: Reached ${EMAIL_LIMIT} email limit (${newTotalSent} total sent). 24-hour cooldown activated.`);
-      } else {
-        // If we haven't reached 400 total, don't start the timer - allow more sends
-        const remaining = EMAIL_LIMIT - newTotalSent;
-        console.log(`✅ Sent ${verifiedFounders.length} emails. Total sent: ${newTotalSent} / ${EMAIL_LIMIT} (${remaining} remaining). Timer not started.`);
+      // Start 24-hour timer after sending emails
+      const timestamp = Date.now();
+      // Get user email - try from auth context first, then localStorage, then fallback
+      let userEmail = user;
+      if (!userEmail) {
+        const savedUser = localStorage.getItem('auth_user');
+        userEmail = savedUser || 'corofy.marketing@gmail.com';
       }
-
-      // Update total emails sent count
-      setTotalEmailsSent(newTotalSent);
+      
+      try {
+        console.log(`⏰ Saving timer to database for ${userEmail}, timestamp:`, timestamp);
+        const response = await fetch('/api/email-timer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userEmail, timestamp })
+        });
+        
+        const responseData = await response.json();
+        console.log('📦 Timer save response:', responseData);
+        
+        if (responseData.success) {
+          setEmailSendTimestamp(timestamp);
+          setTimeRemaining(24 * 60 * 60 * 1000); // 24 hours in milliseconds
+          setCanSendEmails(false);
+          console.log(`✅ Timer started: 24-hour cooldown activated after sending ${verifiedFounders.length} emails.`);
+        } else {
+          const errorMsg = responseData.error || 'Unknown error';
+          console.error('❌ Failed to save timer:', errorMsg);
+          console.error('❌ Error details:', responseData);
+          // Show user-friendly error message
+          alert(`⚠️ Timer could not be saved: ${errorMsg}\n\nPlease ensure the email_send_timestamps table exists in your database.`);
+        }
+      } catch (error) {
+        console.error('❌ Error saving email timer:', error);
+      }
 
       // Show success popup
       setShowEmailSuccessPopup(true);
@@ -627,15 +900,41 @@ export default function FoundersTable() {
         setShowEmailSuccessPopup(false);
       }, 3000);
 
-      // Refresh the data to show updated database status
-      await refreshData();
+      // Don't refresh data - keep rows static (already updated UI state above)
+
+      // Auto-select NEXT 400 unverified emails
+      console.log('🔄 Auto-selecting next batch of 400 emails...');
+      let nextCount = 0;
+
+      setFounders(prevFounders => {
+        // Create a set of all currently sent/verified IDs (including ones just sent)
+        const allSentIds = new Set([...Array.from(sentEmailIds), ...founderIds]);
+
+        return prevFounders.map(f => {
+          // If already sent/verified, keep as is
+          if (allSentIds.has(f.id)) return f;
+
+          // If unverified and we haven't selected 400 yet, select it
+          if (nextCount < 400) {
+            nextCount++;
+            return { ...f, 'Verification': true }; // Check in UI
+          }
+
+          return f;
+        });
+      });
+
+      console.log(`✅ Auto-selected ${nextCount} new emails for next batch`);
+
     } catch (error) {
-      console.error('Error updating verification:', error);
-      alert('❌ Error updating verification in database. Please try again.');
+      console.error('Error sending emails:', error);
+      alert('❌ Error sending emails. Please try again.');
     } finally {
       setIsSendingEmail(false);
     }
   };
+
+  // Timer logic removed - no reset needed
 
   return (
     <div className="bg-white rounded-lg shadow-lg">
@@ -651,29 +950,49 @@ export default function FoundersTable() {
         {!canSendEmails && timeRemaining !== null && (
           <div className="mb-6 bg-orange-50 border-l-4 border-orange-500 p-4 rounded-md">
             <div className="flex items-center justify-between">
-              <div className="flex items-center">
+              <div className="flex items-center flex-1">
                 <svg className="w-6 h-6 text-orange-500 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <div>
+                <div className="flex-1">
                   <h3 className="text-lg font-semibold text-gray-900">Email Sending Paused</h3>
                   <p className="text-sm text-gray-700 mt-1">
                     You can send the next batch of emails in: <span className="font-mono font-bold text-orange-700">{formatTimeRemaining(timeRemaining)}</span>
                   </p>
                   <p className="text-xs text-gray-600 mt-1">
-                    You&apos;ve reached the {EMAIL_LIMIT} email limit ({totalEmailsSent} sent). After the timer expires, you can send more emails.
+                    Please wait for the 24-hour timer to expire before sending more emails.
                   </p>
                 </div>
               </div>
-              <div className="text-center bg-white rounded-lg p-3 shadow-sm border border-orange-200">
-                <div className="text-2xl font-bold text-orange-600">{formatTimeRemaining(timeRemaining)}</div>
-                <div className="text-xs text-gray-500 mt-1">Remaining</div>
+              <div className="flex items-center gap-4 ml-4">
+                <div className="text-center bg-white rounded-lg p-3 shadow-sm border border-orange-200">
+                  <div className="text-2xl font-bold text-orange-600">{formatTimeRemaining(timeRemaining)}</div>
+                  <div className="text-xs text-gray-500 mt-1">Remaining</div>
+                </div>
+                <button
+                  onClick={handleResetTimer}
+                  disabled={isResettingTimer}
+                  className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-md shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                  title="Reset timer to allow immediate email sending"
+                >
+                  {isResettingTimer ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                      <span>Resetting...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                      <span>Reset Timer</span>
+                    </>
+                  )}
+                </button>
               </div>
             </div>
           </div>
         )}
-
-
 
         {/* Industry Filter and Actions */}
         <div className="mb-6 flex flex-col sm:flex-row gap-4 items-start sm:items-end justify-between">
@@ -923,40 +1242,32 @@ export default function FoundersTable() {
                         <div className="flex items-center justify-center">
                           <input
                             type="checkbox"
-                            checked={founder['Verification'] || false}
+                            checked={founder['Verification'] === true}
                             onChange={() => handleVerificationChange(founder.id, founder['Verification'] || false)}
-                            disabled={
-                              !canSendEmails ||
-                              founder['Mail Status'] === 'SENT' ||
-                              founder['Verification'] === true  // Disable if already verified in database
-                            }
-                            className={`h-5 w-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 ${!canSendEmails || founder['Mail Status'] === 'SENT' || founder['Verification'] === true
+                            disabled={sentEmailIds.has(founder.id) || !canSendEmails}
+                            className={`h-5 w-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 ${sentEmailIds.has(founder.id) || !canSendEmails
                               ? 'cursor-not-allowed opacity-50'
                               : 'cursor-pointer'
                               }`}
                             title={
-                              founder['Mail Status'] === 'SENT'
-                                ? 'Mail already sent - cannot modify verification'
-                                : founder['Verification'] === true
-                                  ? 'Already verified in database - cannot uncheck'
-                                  : !canSendEmails
-                                    ? 'Verification locked - waiting for 24-hour timer'
-                                    : founder['Verification']
-                                      ? 'Click to unverify'
-                                      : 'Click to verify'
+                              sentEmailIds.has(founder.id)
+                                ? 'Email sent - cannot uncheck'
+                                : !canSendEmails
+                                ? 'Verification locked - waiting for 24-hour timer'
+                                : 'Click to select for email sending'
                             }
                           />
                         </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
                         {founder['Mail Status'] ? (
-                          <span className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-semibold shadow-sm ${founder['Mail Status'] === 'SENT'
-                            ? 'bg-gradient-to-r from-green-100 to-green-200 text-green-800 border border-green-300'
-                            : 'bg-gradient-to-r from-yellow-100 to-yellow-200 text-yellow-800 border border-yellow-300'
+                          <span className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${founder['Mail Status'] === 'SENT'
+                            ? 'bg-green-100 text-green-800'
+                            : 'bg-yellow-100 text-yellow-800'
                             }`}>
-                            <span className={`w-2 h-2 rounded-full mr-2 ${founder['Mail Status'] === 'SENT' ? 'bg-green-500' : 'bg-yellow-500'
+                            <span className={`w-1.5 h-1.5 rounded-full mr-1.5 ${founder['Mail Status'] === 'SENT' ? 'bg-green-500' : 'bg-yellow-500'
                               }`}></span>
-                            {founder['Mail Status']}
+                            {founder['Mail Status'] === 'SENT' ? 'Sent' : 'Not Sent'}
                           </span>
                         ) : (
                           <span className="text-gray-400">-</span>
@@ -964,9 +1275,9 @@ export default function FoundersTable() {
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
                         {founder['Mail Replys'] ? (
-                          <span className="inline-flex items-center px-3 py-1.5 rounded-full text-xs font-semibold bg-gradient-to-r from-green-100 to-green-200 text-green-800 border border-green-300 shadow-sm">
-                            <svg className="w-3 h-3 mr-1.5" fill="currentColor" viewBox="0 0 20 20">
-                              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+                            <svg className="w-3 h-3 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
                             </svg>
                             Replied
                           </span>
@@ -983,7 +1294,7 @@ export default function FoundersTable() {
                             followUp5Days.toLowerCase() === 'sent';
 
                           return (
-                            <span className={`inline-flex items-center px-2.5 py-1 rounded text-xs font-medium ${isFollowUp5DaysSent
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${isFollowUp5DaysSent
                               ? 'bg-green-100 text-green-800'
                               : 'bg-gray-100 text-gray-600'
                               }`}>
@@ -1001,7 +1312,7 @@ export default function FoundersTable() {
                             followUp10Days.toLowerCase() === 'sent';
 
                           return (
-                            <span className={`inline-flex items-center px-2.5 py-1 rounded text-xs font-medium ${isFollowUp10DaysSent
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${isFollowUp10DaysSent
                               ? 'bg-green-100 text-green-800'
                               : 'bg-gray-100 text-gray-600'
                               }`}>
@@ -1112,32 +1423,37 @@ export default function FoundersTable() {
       </div>
 
       {/* Floating Send Mail Button - Fixed at bottom center */}
-      {getVerifiedFounders().length > 0 && (
-        <div className="fixed bottom-8 left-1/2 transform -translate-x-1/2 z-40 animate-slide-up-bounce">
-          <button
-            onClick={handleSendToWebhook}
-            disabled={isSendingEmail || !canSendEmails}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-4 rounded-full shadow-2xl flex items-center gap-3 transition-all transform hover:scale-105 hover:shadow-3xl disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isSendingEmail ? (
-              <>
-                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div>
-                <span className="font-semibold text-lg">Sending...</span>
-              </>
-            ) : (
-              <>
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                </svg>
-                <span className="font-semibold text-lg">Send Mail</span>
-                <span className="bg-white text-blue-600 rounded-full px-3 py-1 text-sm font-bold">
-                  {getVerifiedFounders().length}
-                </span>
-              </>
-            )}
-          </button>
-        </div>
-      )}
+      {/* Floating Send Mail Button - Fixed at bottom center */}
+      <div className="fixed bottom-8 left-1/2 transform -translate-x-1/2 z-40">
+        {getVerifiedFounders().length > 0 && (
+          <div className="flex flex-col items-center gap-2">
+
+
+            <button
+              onClick={handleSendToWebhook}
+              disabled={isSendingEmail || !canSendEmails}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-4 rounded-full shadow-2xl flex items-center gap-3 transition-all transform hover:scale-105 hover:shadow-3xl disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSendingEmail ? (
+                <>
+                  <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div>
+                  <span className="font-semibold text-lg">Sending...</span>
+                </>
+              ) : (
+                <>
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                  </svg>
+                  <span className="font-semibold text-lg">Send Mail</span>
+                  <span className="bg-white text-blue-600 rounded-full px-3 py-1 text-sm font-bold">
+                    {getVerifiedFounders().length}
+                  </span>
+                </>
+              )}
+            </button>
+          </div>
+        )}
+      </div>
 
       {/* Email Success Toast Notification */}
       {showEmailSuccessPopup && (
@@ -1159,7 +1475,7 @@ export default function FoundersTable() {
                   ✉️ Emails Sent Successfully!
                 </h3>
                 <p className="text-sm text-gray-700 leading-relaxed">
-                  Successfully sent emails to <span className="font-semibold text-green-700">{getVerifiedFounders().length}</span> verified founder{getVerifiedFounders().length !== 1 ? 's' : ''}.
+                  Successfully sent emails to <span className="font-semibold text-green-700">{lastSentCount}</span> verified founder{lastSentCount !== 1 ? 's' : ''}.
                 </p>
                 <p className="text-xs text-gray-500 mt-2">
                   Your workflow has been triggered and all emails are being processed.
@@ -1200,7 +1516,7 @@ export default function FoundersTable() {
                   ⚠️ Selection Limit Reached
                 </h3>
                 <p className="text-sm text-gray-700 leading-relaxed">
-                  You can only select up to <span className="font-semibold text-orange-700">{EMAIL_LIMIT - totalEmailsSent} more email{EMAIL_LIMIT - totalEmailsSent !== 1 ? 's' : ''}</span> ({totalEmailsSent} already sent out of {EMAIL_LIMIT} limit).
+                  You can only select up to <span className="font-semibold text-orange-700">400 emails</span> at a time.
                 </p>
                 <p className="text-xs text-gray-500 mt-2">
                   Please uncheck some emails before selecting more.
@@ -1365,39 +1681,32 @@ export default function FoundersTable() {
         </div>
       )}
 
-      {/* 400 Email Limit Popup */}
+      {/* 400 Email Limit Popup - Premium Modal */}
       {showLimitPopup && (
-        <div className="fixed top-6 left-0 right-0 flex justify-center z-50 px-4">
-          <div className="bg-white rounded-xl shadow-2xl p-5 w-full max-w-md border-l-4 border-red-500 animate-slideDown">
-            <div className="flex items-start gap-4">
-              {/* Warning icon */}
-              <div className="flex-shrink-0">
-                <div className="bg-red-100 rounded-full p-2.5">
-                  <svg className="w-7 h-7 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
-                  </svg>
-                </div>
+        <div className="fixed inset-0 z-50 flex items-center justify-center px-4 bg-black/30 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm border border-gray-100 transform transition-all animate-scaleIn">
+            <div className="flex flex-col items-center text-center">
+              {/* Icon */}
+              <div className="mb-4 bg-orange-50 p-3 rounded-full ring-4 ring-orange-50/50">
+                <svg className="w-8 h-8 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                </svg>
               </div>
 
-              {/* Message */}
-              <div className="flex-1 pt-0.5">
-                <h3 className="text-base font-bold text-gray-900 mb-1">
-                  ⚠️ Email Selection Limit Reached
-                </h3>
-                <p className="text-sm text-gray-700 leading-relaxed">
-                  You can only select <span className="font-semibold text-red-700">400 emails</span> at a time. Please uncheck some emails before selecting more.
-                </p>
-              </div>
+              {/* Content */}
+              <h3 className="text-xl font-bold text-gray-900 mb-2">
+                Limit Reached
+              </h3>
+              <p className="text-gray-600 mb-6 leading-relaxed">
+                You can only select up to <span className="font-bold text-orange-600">400 emails</span> at a time. Please send the current batch first.
+              </p>
 
-              {/* Close button */}
+              {/* Button */}
               <button
                 onClick={() => setShowLimitPopup(false)}
-                className="flex-shrink-0 text-gray-400 hover:text-gray-700 transition-colors ml-2"
-                aria-label="Close notification"
+                className="w-full bg-gray-900 hover:bg-gray-800 text-white font-medium py-2.5 px-4 rounded-xl transition-colors duration-200 shadow-lg shadow-gray-200"
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                Okay, Got it
               </button>
             </div>
           </div>
