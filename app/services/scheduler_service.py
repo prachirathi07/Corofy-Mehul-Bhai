@@ -27,7 +27,7 @@ class SchedulerService:
     def _setup_jobs(self):
         """Define and add jobs to the scheduler"""
         
-        # Job 1: Process Email Queue (Every 15 minutes)
+        # Job 1: Process Email Queue (Every 2 hours)
         self.scheduler.add_job(
             self._run_process_email_queue,
             trigger=IntervalTrigger(hours=2),
@@ -124,6 +124,19 @@ class SchedulerService:
 
     async def _run_rate_limiter_cleanup(self):
         """Wrapper to cleanup rate limiter"""
+        try:
+            # Rate limiter is a singleton, so we just call its method
+            if hasattr(rate_limiter, '_periodic_cleanup'):
+                await rate_limiter._periodic_cleanup()
+                logger.debug("⏰ JOB SUCCESS: Rate Limiter Cleanup")
+        except asyncio.CancelledError:
+            # Expected during shutdown - not an error
+            logger.debug("⏰ Rate Limiter Cleanup cancelled (shutdown)")
+        except Exception as e:
+            logger.error(f"❌ JOB ERROR (Rate Limiter Cleanup): {e}", exc_info=True)
+
+    async def _run_check_replies(self):
+        """Wrapper to check for email replies"""
         try:
             logger.info("⏰ JOB START: Checking Email Replies")
             reply_service = ReplyService()
