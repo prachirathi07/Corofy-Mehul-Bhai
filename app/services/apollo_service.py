@@ -255,8 +255,8 @@ class ApolloService:
                     "X-Api-Key": self.api_key
                 }
 
-                # CORRECT ENDPOINT: /mixed_people/api_search
-                url = f"{self.BASE_URL}/mixed_people/api_search"
+                # CORRECT ENDPOINT: /mixed_people/search
+                url = f"{self.BASE_URL}/mixed_people/search"
                 
                 logger.debug(f"📤 Apollo API Payload Page {page}: {payload}")
 
