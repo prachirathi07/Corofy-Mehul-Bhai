@@ -278,19 +278,10 @@ class ApolloService:
                 people = data.get("people", [])
                 logger.info(f"Apollo Search: Page {page} returned {len(people)} leads")
                 
-                # VALIDATION: Filter results to ensure they match SIC codes
+                # Apollo API already filters by SIC codes via organization_sic_codes parameter
+                # No need for client-side validation - trust Apollo's filtering
                 if sic_codes and len(sic_codes) > 0:
-                    filtered_people = []
-                    for person in people:
-                        org = person.get("organization", {})
-                        org_sic_codes = org.get("sic_codes", [])
-                        # Check if organization has any of the requested SIC codes
-                        if org_sic_codes and any(str(sic) in [str(s) for s in org_sic_codes] for sic in sic_codes):
-                            filtered_people.append(person)
-                        else:
-                            logger.warning(f"⚠️ Filtered out lead {person.get('name', 'Unknown')} - Organization SIC codes {org_sic_codes} don't match requested {sic_codes}")
-                    people = filtered_people
-                    logger.info(f"✅ After SIC code validation: {len(people)} leads match SIC codes {sic_codes}")
+                    logger.info(f"✅ Received {len(people)} leads pre-filtered by Apollo for SIC codes: {sic_codes}")
 
                 all_people.extend(people)
 
@@ -501,19 +492,10 @@ class ApolloService:
                 people = data.get("people", [])
                 logger.info(f"Apollo Search: Page {page} returned {len(people)} leads")
                 
-                # VALIDATION: Filter results to ensure they match SIC codes
+                # Apollo API already filters by SIC codes via organization_sic_codes parameter
+                # No need for client-side validation - trust Apollo's filtering
                 if sic_codes and len(sic_codes) > 0:
-                    filtered_people = []
-                    for person in people:
-                        org = person.get("organization", {})
-                        org_sic_codes = org.get("sic_codes", [])
-                        # Check if organization has any of the requested SIC codes
-                        if org_sic_codes and any(str(sic) in [str(s) for s in org_sic_codes] for sic in sic_codes):
-                            filtered_people.append(person)
-                        else:
-                            logger.warning(f"⚠️ Filtered out lead {person.get('name', 'Unknown')} - Organization SIC codes {org_sic_codes} don't match requested {sic_codes}")
-                    people = filtered_people
-                    logger.info(f"✅ After SIC code validation: {len(people)} leads match SIC codes {sic_codes}")
+                    logger.info(f"✅ Received {len(people)} leads pre-filtered by Apollo for SIC codes: {sic_codes}")
 
                 all_people.extend(people)
 
